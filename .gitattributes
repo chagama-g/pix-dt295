@@ -1,0 +1,39 @@
+# Line endings: text files are stored with LF in the repository (Git detects text);
+# the working-tree ending follows core.autocrlf, except for the files pinned below.
+* text=auto
+
+# Windows-only files stay CRLF in every checkout: cmd.exe misreads LF batch files
+# (labels, multi-line blocks); the sample ini is copied into the TVTest folder and
+# edited there.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ini text eol=crlf
+
+# Run by a Unix shell (WSL / Linux).
+*.sh text eol=lf
+/packaging/arch/** text eol=lf
+
+# Hunk headers name the enclosing function in diffs.
+*.rs diff=rust
+*.c diff=cpp
+*.h diff=cpp
+*.cpp diff=cpp
+*.md diff=markdown
+
+# Binary: never convert line endings or diff as text. *.bin is the byte-exact
+# decoder init table (src/dt295/src/s1/decoder_init.bin); the vendor firmware images
+# are not committed (.gitignore).
+*.bin binary
+*.dll binary
+*.exe binary
+*.sys binary
+*.pdb binary
+*.ts binary
+*.pcapng binary
+*.etl binary
+*.png binary
+*.jpg binary
+*.zip binary
+
+# Copied as they are to a Linux machine: a CRLF script does not run.
+packaging/examples/** text eol=lf

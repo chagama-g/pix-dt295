@@ -1,0 +1,15 @@
+[Unit]
+Description=PIX-DT295 tuner daemon (dt295 serve)
+After=network.target
+
+[Service]
+User=dt295
+Group=dt295
+RuntimeDirectory=dt295
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/dt295 serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

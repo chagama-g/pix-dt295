@@ -1,0 +1,57 @@
+# Builds the dt295 command and its service files from this repository's committed
+# HEAD: run `makepkg -si` here (packaging/arch/). The vendor firmware is not packaged;
+# see INSTALL.md.
+
+pkgname=pix-dt295-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='User-mode driver and tuner daemon for the Pixela PIX-DT295 (dt295 serve / tune for mirakc)'
+arch=('x86_64')
+license=('MIT')
+depends=('glibc' 'libgcc')
+makedepends=('cargo' 'git')
+provides=('pix-dt295')
+conflicts=('pix-dt295')
+install=pix-dt295.install
+source=("pix-dt295::git+file://$(realpath "$startdir/../..")")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd pix-dt295
+  printf '%s.r%s.g%s' \
+    "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd pix-dt295
+  # rust-toolchain.toml asks rustup for the Windows targets; the package needs only the host.
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd pix-dt295
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p dt295-cli
+}
+
+check() {
+  cd pix-dt295
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --frozen -p dt295-usb -p dt295 -p dt295-cli
+}
+
+package() {
+  cd pix-dt295
+  install -Dm755 target/release/dt295 -t "$pkgdir/usr/bin"
+  install -Dm644 packaging/arch/dt295.service -t "$pkgdir/usr/lib/systemd/system"
+  install -Dm644 packaging/arch/dt295.sysusers "$pkgdir/usr/lib/sysusers.d/dt295.conf"
+  install -Dm644 packaging/arch/dt295.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/dt295.conf"
+  install -Dm644 packaging/arch/60-dt295.rules -t "$pkgdir/usr/lib/udev/rules.d"
+  # The firmware goes here (the default firmware-dir of dt295 serve).
+  install -dm755 "$pkgdir/usr/lib/firmware/dt295"
+  install -Dm644 README.md INSTALL.md docs/usage.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+}

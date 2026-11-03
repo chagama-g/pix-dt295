@@ -1,0 +1,9 @@
+#!/bin/sh
+# Station logos for mirakc: BS / CS from service 929, then the CDT of each terrestrial
+# channel of the mirakc configuration. Set unit to the serial number of your unit.
+unit=AB12345678
+dir=/var/lib/dt295/logos
+dt295 tune --serial $unit --if-free --sat 1318000000 --tsid 40f1 --sid 929 | dt295 logo --ts - --mirakc $dir
+grep -o -- '--ter [0-9]*' /etc/mirakc/config.yml | sort -u | while read -r tune; do
+  dt295 tune --serial $unit --if-free $tune | dt295 logo --ts - --mirakc $dir --wait 15
+done

@@ -1,0 +1,34 @@
+[package]
+name = "dt295-bondriver"
+description = "TVTest BonDriver for the PIX-DT295 (BonDriver_DT295.dll)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+# The DLL must be named BonDriver_*.dll for TVTest to list it.
+name = "BonDriver_DT295"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dt295.workspace = true
+rust-ini.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# + GetLocalTime (log stamps) and MultiByteToWideChar (an ANSI ini file).
+windows-sys = { workspace = true, features = [
+    "Win32_System_SystemInformation",
+    "Win32_Globalization",
+] }
+
+[build-dependencies]
+cc.workspace = true
+
+[lints]
+workspace = true

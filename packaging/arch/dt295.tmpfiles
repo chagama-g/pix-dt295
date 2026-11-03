@@ -1,0 +1,2 @@
+# The state files (<serial>.state, with the device's link key) and the station logos.
+d /var/lib/dt295 0750 dt295 dt295 -

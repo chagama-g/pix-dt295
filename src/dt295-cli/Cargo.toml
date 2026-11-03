@@ -1,0 +1,50 @@
+[package]
+name = "dt295-cli"
+description = "Command-line tools for the PIX-DT295: capture, channel lineups, station logos, the Linux daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "dt295"
+path = "src/main.rs"
+# the library of the same name (dt295) carries the API docs
+doc = false
+
+[dependencies]
+dt295.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+quick-xml.workspace = true
+# /etc/dt295.conf of `dt295 serve`
+rust-ini.workspace = true
+similar.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM / SIGINT / SIGHUP: a recorder stops `dt295 capture` with them.
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Console: Ctrl-C stops a capture cleanly. The rest: `dt295 driver` (SetupAPI, the
+# driver key, elevation via UAC).
+windows-sys = { workspace = true, features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[build-dependencies]
+cc.workspace = true
+
+[lints]
+workspace = true

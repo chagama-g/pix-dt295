@@ -1,0 +1,51 @@
+# Vendor driver/app package: large (~187 MB) and redistribution-restricted.
+# Kept locally as analysis input; not committed. Remove this line if you
+# deliberately want it tracked.
+drivers/
+
+# Vendor firmware images (redistribution-restricted), wherever a copy lands for a
+# test (next to a DLL, in a scratch folder).
+mb86m01_*.bin
+
+# Local work area: analysis databases, extracted packages, USB captures / ETW traces,
+# run logs. Large, machine-specific, may hold device serials or keys; never committed.
+/temp/
+
+# Rust build output
+/target
+**/*.rs.bk
+
+# USB captures and TS dumps (large binary: reference input and capture output).
+# Kept locally only.
+*.pcapng
+*.etl
+*.ts
+
+# Run output: driver / probe logs (the BonDriver keeps the previous run as .log.1),
+# capture logs. Machine- and run-specific; may contain the device serial.
+*.log
+*.log.[0-9]
+
+# BonDriver / TVTest runtime files written next to the DLL: the state file holds the
+# device's link key; the .ch2 is TVTest's scan result for this receiver.
+*.state
+*.state.tmp
+*.ch2
+
+# Editors / OS
+.vs/
+.vscode/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Agent worktrees
+/.claude/
+
+# makepkg output in packaging/arch/ (the clone of this repository, build tree, package)
+/packaging/arch/pix-dt295/
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar*

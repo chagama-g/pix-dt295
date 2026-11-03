@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+    "src/dt295-usb",
+    "src/dt295",
+    "src/dt295-bondriver",
+    "src/dt295-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+dt295-usb = { path = "src/dt295-usb" }
+dt295 = { path = "src/dt295" }
+
+# Windows: WinUSB / SetupAPI / file and thread APIs for the USB backend and the DLL.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Usb",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_System_Diagnostics_Debug",
+] }
+# Linux / other unix: usbfs via nusb; signals for dt295 capture.
+nusb = "0.2.8"
+libc = "0.2.191"
+
+aes = "0.9.3"
+cbc = "0.2.1"
+crc = "3.4.0"
+getrandom = "0.4.3"
+rust-ini = { version = "0.21.3", features = ["case-insensitive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2.5"
+clap = { version = "4.6.7", features = ["derive"] }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+cc = "1.8.0"
+quick-xml = "0.42.0"
+similar = "3.2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# panic stays "unwind": every FFI entry point catches panics (catch_unwind) so a bug
+# cannot abort the host (TVTest) process.

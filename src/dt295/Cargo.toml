@@ -1,0 +1,20 @@
+[package]
+name = "dt295"
+description = "PIX-DT295 user-mode driver core: firmware boot, auth, tuning, System1 TS streaming"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dt295-usb.workspace = true
+aes.workspace = true
+cbc.workspace = true
+crc.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

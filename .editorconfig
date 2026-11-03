@@ -1,0 +1,22 @@
+# Editor defaults (https://editorconfig.org). Line endings are left to .gitattributes
+# and core.autocrlf, except for the Windows-only files that must be CRLF.
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Test strings carry trailing spaces on purpose (config.rs: a value with a trailing
+# blank); rustfmt keeps the code itself clean.
+[*.rs]
+trim_trailing_whitespace = false
+
+# Two trailing spaces are a Markdown line break.
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{cmd,bat,ini}]
+end_of_line = crlf
