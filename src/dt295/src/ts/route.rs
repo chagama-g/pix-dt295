@@ -322,14 +322,14 @@ mod tests {
         streams: &[(u8, u16, Option<u16>)],
     ) -> Vec<u8> {
         let ca = |pid: u16| [TAG_CA, 4, 0x00, 0x05, 0xE0 | (pid >> 8) as u8, pid as u8];
-        let info: Vec<u8> = ecm.map(|e| ca(e).to_vec()).unwrap_or_default();
+        let info: Vec<u8> = ecm.map_or_default(|e| ca(e).to_vec());
         let mut s = vec![TID_PMT, 0, 0];
         s.extend_from_slice(&program.to_be_bytes());
         s.extend_from_slice(&[0xC1, 0, 0, 0xE0 | (pcr >> 8) as u8, pcr as u8]);
         s.extend_from_slice(&[0xF0 | (info.len() >> 8) as u8, info.len() as u8]);
         s.extend_from_slice(&info);
         for &(st, pid, own) in streams {
-            let d: Vec<u8> = own.map(|e| ca(e).to_vec()).unwrap_or_default();
+            let d: Vec<u8> = own.map_or_default(|e| ca(e).to_vec());
             s.extend_from_slice(&[st, 0xE0 | (pid >> 8) as u8, pid as u8]);
             s.extend_from_slice(&[0xF0 | (d.len() >> 8) as u8, d.len() as u8]);
             s.extend_from_slice(&d);

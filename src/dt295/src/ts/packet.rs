@@ -36,17 +36,17 @@ pub fn pusi(p: &[u8]) -> bool {
 /// transport_scrambling_control (0..=3). The device marks its link-encrypted packets
 /// with 01, a value ARIB leaves unused.
 pub fn tsc(p: &[u8]) -> u8 {
-    p.get(3).map_or(0, |b| b >> 6)
+    p.get(3).map_or_default(|b| b >> 6)
 }
 
 /// adaptation_field_control (0..=3).
 pub fn afc(p: &[u8]) -> u8 {
-    p.get(3).map_or(0, |b| (b >> 4) & 3)
+    p.get(3).map_or_default(|b| (b >> 4) & 3)
 }
 
 /// continuity_counter (0..=15).
 pub fn cc(p: &[u8]) -> u8 {
-    p.get(3).map_or(0, |b| b & 0x0F)
+    p.get(3).map_or_default(|b| b & 0x0F)
 }
 
 /// Offset of the payload, or `None` without payload (afc 0/2) or a bad adaptation

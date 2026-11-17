@@ -131,7 +131,7 @@ impl Reply {
         }
         match line.strip_prefix("busy ") {
             Some(why) => Self::Busy(why.to_owned()),
-            None => Self::Error(line.strip_prefix("error ").unwrap_or(line).to_owned()),
+            None => Self::Error(line.trim_prefix("error ").to_owned()),
         }
     }
 }

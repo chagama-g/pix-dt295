@@ -502,7 +502,7 @@ fn pause(secs: u64, deadline: u64) {
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map_or_default(|d| d.as_secs())
 }
 
 /// Now as TVTest's time: seconds since 1601-01-01 in Japan time.

@@ -20,49 +20,44 @@ pub(crate) fn check_read_queue(ep: u8, n: usize, size: usize) -> Result<()> {
 /// A control transfer's direction (bit 7 of `bmRequestType`) must match the call:
 /// an IN request on `control_out` would let the device write into a shared slice.
 pub(crate) fn check_control_dir(request_type: u8, want_in: bool) -> Result<()> {
-    if is_in(request_type) == want_in {
-        Ok(())
-    } else {
-        Err(Error::Param)
-    }
+    (is_in(request_type) == want_in).ok_or(Error::Param)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
     fn read_queue_params() {
         assert!(check_read_queue(0x81, 8, 0x10000).is_ok());
         assert!(check_read_queue(0x81, 1, 512).is_ok());
-        assert!(
-            matches!(check_read_queue(0x02, 8, 0x10000), Err(Error::Param)),
+        assert_matches!(
+            check_read_queue(0x02, 8, 0x10000),
+            Err(Error::Param),
             "OUT endpoint"
         );
-        assert!(
-            matches!(check_read_queue(0x81, 0, 0x10000), Err(Error::Param)),
+        assert_matches!(
+            check_read_queue(0x81, 0, 0x10000),
+            Err(Error::Param),
             "n == 0"
         );
-        assert!(
-            matches!(check_read_queue(0x81, 8, 0), Err(Error::Param)),
-            "size == 0"
-        );
-        assert!(
-            matches!(check_read_queue(0x81, 8, 1000), Err(Error::Param)),
+        assert_matches!(check_read_queue(0x81, 8, 0), Err(Error::Param), "size == 0");
+        assert_matches!(
+            check_read_queue(0x81, 8, 1000),
+            Err(Error::Param),
             "size % 512"
         );
-        assert!(matches!(
-            check_read_queue(0x81, 8, 0x10000 + 188),
-            Err(Error::Param)
-        ));
+        assert_matches!(check_read_queue(0x81, 8, 0x10000 + 188), Err(Error::Param));
     }
 
     #[test]
     fn control_direction() {
         assert!(check_control_dir(0xC0, true).is_ok());
         assert!(check_control_dir(0x40, false).is_ok());
-        assert!(matches!(check_control_dir(0x40, true), Err(Error::Param)));
-        assert!(matches!(check_control_dir(0xC0, false), Err(Error::Param)));
+        assert_matches!(check_control_dir(0x40, true), Err(Error::Param));
+        assert_matches!(check_control_dir(0xC0, false), Err(Error::Param));
     }
 
     #[test]

@@ -165,6 +165,7 @@ mod tests {
         let st = State {
             link_key: Some([1; 16]),
             pending_keys: Vec::new(),
+            raw_channel: None,
             psi: vec![
                 psi(1, false, 0x40F1, 20_740),
                 psi(4, false, 0x40F1, 20_745),

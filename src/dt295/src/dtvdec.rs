@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::auth::{Block, cbc0_decrypt, nonce, t8_raw};
 use crate::cas::rpc_block;
-use crate::proto::Io;
+use dt295_core::proto::Io;
 use crate::{Error, Result};
 
 /// The 07/01/06 request carrying `nonce4`.

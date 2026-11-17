@@ -61,13 +61,17 @@ mod daemon {
             "dt295 {}: listening on {}; units: {}",
             env!("DT295_VERSION"),
             conf.socket.display(),
-            conf.units.join(", ")
+            conf.units
+                .iter()
+                .map(|u| u.serial.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let mut units = Vec::new();
-        for serial in &conf.units {
-            let (jobs, thread) = unit::spawn(serial.clone(), Arc::clone(&conf))
-                .with_context(|| format!("cannot start the thread of unit {serial}"))?;
-            units.push((serial.clone(), jobs, thread));
+        for u in &conf.units {
+            let (jobs, thread) = unit::spawn(u.serial.clone(), u.raw_ts, Arc::clone(&conf))
+                .with_context(|| format!("cannot start the thread of unit {}", u.serial))?;
+            units.push((u.serial.clone(), jobs, thread));
         }
         let routes: Vec<(String, Sender<Job>)> = units
             .iter()

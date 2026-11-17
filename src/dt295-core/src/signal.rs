@@ -6,7 +6,7 @@
 //!   C/N = -1634.6 P^5 + 14341 P^4 - 50259 P^3 + 88977 P^2 - 89565 P + 58857
 
 /// ISDB-T C/N (0.001 dB) of the 3-byte value at demod register 0x8B.
-pub(crate) fn cn_t_mdb(raw: u32) -> i32 {
+pub fn cn_t_mdb(raw: u32) -> i32 {
     if raw == 0 {
         return 0;
     }
@@ -16,7 +16,7 @@ pub(crate) fn cn_t_mdb(raw: u32) -> i32 {
 }
 
 /// ISDB-S C/N (0.001 dB) of the 2-byte value at demod register 0xBC.
-pub(crate) fn cn_s_mdb(raw: u32) -> i32 {
+pub fn cn_s_mdb(raw: u32) -> i32 {
     if raw < 3000 {
         return 0;
     }

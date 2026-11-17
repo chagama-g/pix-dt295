@@ -9,13 +9,16 @@
 //! socket = /run/dt295/dt295.sock
 //!
 //! [unit AB12345678]
+//! ; blob-free raw-TS: no vendor firmware, the device streams the scrambled TS and
+//! ; the host descrambles it (default off, i.e. System1 with the in-device card)
 //! [unit CD23456789]
+//! raw-ts = true
 //! ```
 //!
 //! The `[dt295]` settings are optional (these are the defaults); there is one
-//! `[unit <serial>]` per PIX-DT295 to serve. Unknown sections and settings are
-//! errors, so a typo does not go unnoticed. Comments take a line of their own (`;`
-//! or `#` first): after a value they would be part of it.
+//! `[unit <serial>]` per PIX-DT295 to serve, whose only setting is `raw-ts`. Unknown
+//! sections and settings are errors, so a typo does not go unnoticed. Comments take a
+//! line of their own (`;` or `#` first): after a value they would be part of it.
 
 use std::path::{Path, PathBuf};
 
@@ -37,8 +40,18 @@ pub struct Conf {
     pub firmware_dir: PathBuf,
     pub state_dir: PathBuf,
     pub socket: PathBuf,
-    /// The USB serial numbers of the units to serve, in file order.
-    pub units: Vec<String>,
+    /// The units to serve, in file order.
+    pub units: Vec<Unit>,
+}
+
+/// One `[unit <serial>]` of the configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unit {
+    /// The USB serial number.
+    pub serial: String,
+    /// Blob-free raw-TS: no vendor firmware, the device streams the scrambled TS and
+    /// the host descrambles it (`raw-ts = true`); default off (System1).
+    pub raw_ts: bool,
 }
 
 impl Conf {
@@ -73,13 +86,20 @@ impl Conf {
                     }
                 }
                 [kind, serial] if kind.eq_ignore_ascii_case("unit") => {
-                    if let Some((key, _)) = props.iter().next() {
-                        bail!("[unit {serial}]: unknown setting {key:?}");
-                    }
-                    if conf.units.iter().any(|u| u.eq_ignore_ascii_case(serial)) {
+                    if conf.units.iter().any(|u| u.serial.eq_ignore_ascii_case(serial)) {
                         bail!("[unit {serial}] appears twice");
                     }
-                    conf.units.push((*serial).to_owned());
+                    let mut raw_ts = false;
+                    for (key, value) in props {
+                        match key.to_ascii_lowercase().as_str() {
+                            "raw-ts" => raw_ts = parse_bool(value)?,
+                            _ => bail!("[unit {serial}]: unknown setting {key:?}"),
+                        }
+                    }
+                    conf.units.push(Unit {
+                        serial: (*serial).to_owned(),
+                        raw_ts,
+                    });
                 }
                 _ => bail!(
                     "unknown section [{}] (expected [dt295] or [unit <serial>])",
@@ -108,6 +128,15 @@ impl Conf {
     }
 }
 
+/// A boolean setting value (`true`/`false`, also yes/no, on/off, 1/0).
+fn parse_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        other => bail!("raw-ts must be true or false, not {other:?}"),
+    }
+}
+
 /// The socket a client (`dt295 tune`, a scan) connects to: `socket` if given, else
 /// the one of the configuration (`config`, or /etc/dt295.conf if it exists), else
 /// the default.
@@ -131,7 +160,11 @@ mod tests {
         let c = Conf::parse("[unit AB12345678]\n[unit cd23456789]\n").unwrap();
         assert_eq!(c.firmware_dir, Path::new(DEFAULT_FIRMWARE_DIR));
         assert_eq!(c.socket, Path::new(DEFAULT_SOCKET));
-        assert_eq!(c.units, ["AB12345678", "cd23456789"]);
+        assert_eq!(
+            c.units.iter().map(|u| u.serial.as_str()).collect::<Vec<_>>(),
+            ["AB12345678", "cd23456789"]
+        );
+        assert!(c.units.iter().all(|u| !u.raw_ts), "default off");
         assert_eq!(
             c.idle_firmware(),
             Path::new("/usr/lib/firmware/dt295/mb86m01_assp_osec_idle.bin")
@@ -164,10 +197,19 @@ mod tests {
         assert!(err("").contains("no [unit"));
         assert!(err("[dt295]\nfirmware = /x\n[unit A]\n").contains("unknown setting"));
         assert!(err("[unit A]\nname = x\n").contains("unknown setting"));
+        assert!(err("[unit A]\nraw-ts = maybe\n").contains("true or false"));
         assert!(err("[units A]\n").contains("unknown section"));
         assert!(err("[unit A B]\n").contains("unknown section"));
         assert!(err("[unit A]\n[unit a]\n").contains("twice"));
         assert!(err("socket = /x\n[unit A]\n").contains("before the first section"));
+    }
+
+    #[test]
+    fn per_unit_raw_ts() {
+        let c = Conf::parse("[unit A]\n[unit B]\nraw-ts = true\n").unwrap();
+        assert_eq!(c.units[0].serial, "A");
+        assert!(!c.units[0].raw_ts, "default off");
+        assert!(c.units[1].raw_ts, "opted in");
     }
 
     #[test]

@@ -28,14 +28,14 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::device::Shared;
-use crate::fw::{bulk_download, write_idle_params};
-use crate::proto::{FW_STALL_LIMIT, Io, REG_FW_STATE, REG_IRQ, sleep_ms};
+use dt295_core::fwdl::{bulk_download, write_idle_params};
+use dt295_core::proto::{FW_STALL_LIMIT, Io, REG_FW_STATE, REG_IRQ, sleep_ms};
 use crate::ts::link::{self, KeyVerdict};
 use crate::ts::{packet, route};
 use crate::{Error, Result, System, TsSink, cas, dtvdec};
 
 /// The TS endpoint.
-pub(crate) const EP_TS: u8 = 0x81;
+pub(crate) use dt295_core::EP_TS;
 /// Keepalive interval, well within the about 60 s the firmware gives a running session
 /// after the last keepalive (hardware 2026-10-31, two units: 60-61 s, streaming or idle).
 /// A session that only authenticated does not time out (not within 200 s).
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn keepalive_retries_once_early() {
-        let t0 = Instant::now() + Duration::from_secs(3600); // well clear of boot
+        let t0 = Instant::now() + Duration::from_hours(1); // well clear of boot
         let due = |last: Option<Instant>| last.map(|l| l + KA_INTERVAL - t0);
         // success: due a whole interval later, failures cleared
         assert_eq!(ka_schedule(t0, true, 0), (Some(t0), 0));

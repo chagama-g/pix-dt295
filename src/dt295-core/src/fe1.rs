@@ -16,7 +16,7 @@ const DEMOD_T: u8 = 0x20;
 const DEMOD_S: u8 = 0x22;
 
 /// The I2C bus as the front end sees it (the device's type-9 I2C, or a test recorder).
-pub(crate) trait Bus {
+pub trait Bus {
     fn i2c_write(&mut self, slave: u8, data: &[u8]) -> Result<()>;
     fn i2c_write_read(&mut self, slave: u8, wdata: &[u8], rbuf: &mut [u8]) -> Result<()>;
     fn sleep_ms(&mut self, ms: u64);
@@ -45,11 +45,7 @@ impl Bus for Io<'_> {
 /// wait of seconds (a recorder gives its tuner command ~16 s, and the host recovers the
 /// device on this error).
 fn not_wedged(b: &impl Bus) -> Result<()> {
-    if b.wedged() {
-        Err(Error::Timeout("firmware wedged (not acking commands)"))
-    } else {
-        Ok(())
-    }
+    (!b.wedged()).ok_or(Error::Timeout("firmware wedged (not acking commands)"))
 }
 
 // ---- captured init tables ----
@@ -193,7 +189,7 @@ fn park_s(b: &mut impl Bus) {
 
 /// Front-end power-on: the T demod, T tuner, S demod and S tuner init tables, the S
 /// tuner parked.
-pub(crate) fn power_on_init(b: &mut impl Bus) -> Result<()> {
+pub fn power_on_init(b: &mut impl Bus) -> Result<()> {
     info!("front-end init (T/S sequence)");
     for [r, v] in DEMOD_T_INIT {
         let _ = d_write(b, DEMOD_T, r, v);
@@ -218,7 +214,9 @@ pub(crate) fn power_on_init(b: &mut impl Bus) -> Result<()> {
 /// 0.7-1.0 s).
 const T_NO_SIGNAL_POLLS: u32 = 16;
 
-fn wait_lock_t(b: &mut impl Bus) {
+/// Poll demod reg 0x80 until lock (0x00) or no-signal; return whether it locked. No
+/// side-effect writes -- the caller decides what (if anything) to write after lock.
+pub fn wait_lock_t_bare(b: &mut impl Bus) -> bool {
     let t0 = std::time::Instant::now();
     let mut v = 0u8;
     let mut no_signal = 0;
@@ -226,7 +224,7 @@ fn wait_lock_t(b: &mut impl Bus) {
     // up after T_NO_SIGNAL_POLLS: a channel scan meets 40 of them on UHF alone.
     for _ in 0..60 {
         if b.wedged() {
-            return;
+            return false;
         }
         if let Ok(x) = d_read(b, DEMOD_T, 0x80) {
             v = x;
@@ -236,20 +234,11 @@ fn wait_lock_t(b: &mut impl Bus) {
                     "fe1: T no signal (reg0x80=0x{x:02x}) [{} ms]",
                     t0.elapsed().as_millis()
                 );
-                return;
+                return false;
             }
             if x == 0x00 {
                 info!("fe1: T locked [{} ms]", t0.elapsed().as_millis());
-                b.sleep_ms(120);
-                let _ = d_write(b, DEMOD_T, 0x1D, 0x02);
-                let _ = d_write(b, DEMOD_T, 0x1E, 0x2A);
-                let _ = d_write(b, DEMOD_T, 0x1F, 0x8A);
-                for r in [0x77, 0x76, 0x5C] {
-                    if let Ok(rr) = d_read(b, DEMOD_T, r) {
-                        let _ = d_write(b, DEMOD_T, r, rr);
-                    }
-                }
-                return;
+                return true;
             }
         }
         b.sleep_ms(50);
@@ -258,11 +247,29 @@ fn wait_lock_t(b: &mut impl Bus) {
         "fe1: T did not lock (reg0x80=0x{v:02x}) [{} ms]",
         t0.elapsed().as_millis()
     );
+    false
 }
 
-/// Tune ISDB-T (`freq_hz` = the channel centre) and wait for lock (a missing lock is
-/// logged, not an error: the caller reads the status).
-pub(crate) fn tune_t(b: &mut impl Bus, freq_hz: u32) -> Result<()> {
+pub fn wait_lock_t(b: &mut impl Bus) {
+    if wait_lock_t_bare(b) {
+        // Stock post-lock writes (the vendor's settle after an ISDB-T lock).
+        b.sleep_ms(120);
+        let _ = d_write(b, DEMOD_T, 0x1D, 0x02);
+        let _ = d_write(b, DEMOD_T, 0x1E, 0x2A);
+        let _ = d_write(b, DEMOD_T, 0x1F, 0x8A);
+        for r in [0x77, 0x76, 0x5C] {
+            if let Ok(rr) = d_read(b, DEMOD_T, r) {
+                let _ = d_write(b, DEMOD_T, r, rr);
+            }
+        }
+    }
+}
+
+/// The forward (pre-lock) part of an ISDB-T tune: park S, wake T, write the PRE block,
+/// the tuner frequency/band, the twiddles, and the TS-output registers 0x0E/0x0F/0x01/
+/// 0x23. Used by [`tune_t`]; it leaves 0x1D/0x1E/0x1F at the PRE value 0xAA, so the
+/// caller sets their final 02/2A/8A values.
+fn tune_t_forward(b: &mut impl Bus, freq_hz: u32) {
     const PRE: [[u8; 2]; 6] = [
         [0x03, 0x00],
         [0x1D, 0xAA],
@@ -314,9 +321,28 @@ pub(crate) fn tune_t(b: &mut impl Bus, freq_hz: u32) -> Result<()> {
     let _ = d_write(b, DEMOD_T, 0x0F, 0x10);
     let _ = d_write(b, DEMOD_T, 0x01, 0x40);
     let _ = d_write(b, DEMOD_T, 0x23, 0x4C);
+}
+
+/// Tune ISDB-T (`freq_hz` = the channel centre) and wait for lock (a missing lock is
+/// logged, not an error: the caller reads the status). The stock path: 0x1D/0x1E/0x1F
+/// = 02/2A/8A are written AFTER lock (in [`wait_lock_t`]).
+pub fn tune_t(b: &mut impl Bus, freq_hz: u32) -> Result<()> {
+    tune_t_forward(b, freq_hz);
     not_wedged(b)?;
     wait_lock_t(b);
     not_wedged(b)
+}
+
+/// Read an ISDB-T demod register (slave DEMOD_T); `0xee` if the read fails. Reg 0x80
+/// bit 7 set = no signal / no lock.
+pub fn read_t(b: &mut impl Bus, reg: u8) -> u8 {
+    d_read(b, DEMOD_T, reg).unwrap_or(0xee)
+}
+
+/// Read an ISDB-S demod register (slave DEMOD_S); `0xff` if the read fails. Reg 0xC3 == 0x00
+/// = locked (same convention as [`read_status`] / `wait_lock_s`).
+pub fn read_s(b: &mut impl Bus, reg: u8) -> u8 {
+    d_read(b, DEMOD_S, reg).unwrap_or(0xff)
 }
 
 // ---- ISDB-S tune (TUNE_S_SEQ) ----
@@ -396,7 +422,7 @@ fn wait_lock_s(b: &mut impl Bus) -> bool {
 
 /// The TSIDs the transponder carries, from its TMCC (demod S reg 0xCE: eight
 /// big-endian slots; 0 and 0xFFFF are empty), in slot order. (hardware 2026-10-29)
-pub(crate) fn ts_ids_s(b: &mut impl Bus) -> Result<Vec<u16>> {
+pub fn ts_ids_s(b: &mut impl Bus) -> Result<Vec<u16>> {
     let mut x = [0u8; 16];
     b.i2c_write_read(DEMOD_S, &[0xCE], &mut x)?;
     let (slots, _) = x.as_chunks::<2>();
@@ -410,7 +436,7 @@ pub(crate) fn ts_ids_s(b: &mut impl Bus) -> Result<Vec<u16>> {
 /// The TSID the demod streams (demod S reg 0xE6, big-endian; a TSID the transponder
 /// does not carry reads as its first TS, the one streamed then; without a TSID,
 /// 0xFFFF). (hardware 2026-10-29)
-pub(crate) fn ts_id_s(b: &mut impl Bus) -> Result<u16> {
+pub fn ts_id_s(b: &mut impl Bus) -> Result<u16> {
     let mut x = [0u8; 2];
     b.i2c_write_read(DEMOD_S, &[0xE6], &mut x)?;
     Ok(u16::from_be_bytes(x))
@@ -450,7 +476,7 @@ fn check_ts_s(b: &mut impl Bus, tsid: u16) -> Option<u16> {
 
 /// Tune ISDB-S (`freq_hz` = IF, `tsid` = the wanted TS) and wait for lock. Returns the
 /// TSID the demod streams, when it could be read.
-pub(crate) fn tune_s(b: &mut impl Bus, freq_hz: u32, tsid: u16) -> Result<Option<u16>> {
+pub fn tune_s(b: &mut impl Bus, freq_hz: u32, tsid: u16) -> Result<Option<u16>> {
     let v = ((u64::from(freq_hz) + 250_000) / 500_000) as u32; // round(IF_MHz / 0.5)
     let [r8f, r90] = tsid.to_be_bytes();
     // CS110 TSIDs are 0x6xxx / 0x7xxx (BS: 0x4xxx); an older `r8f == 0x60` test
@@ -503,7 +529,7 @@ pub(crate) fn tune_s(b: &mut impl Bus, freq_hz: u32, tsid: u16) -> Result<Option
 /// ISDB-S demod sample, the registers the vendor driver polls while streaming (as
 /// provided by a third party): lock 0xC3 (0 = locked), C/N 0xBC (2 B) and the two 3-byte error
 /// counters 0xEB and 0xF0 ("mostly 0, now and then non-zero"). (lock, cn_raw, eb, f0).
-pub(crate) fn sample_s(b: &mut impl Bus) -> Result<(u8, u32, u32, u32)> {
+pub fn sample_s(b: &mut impl Bus) -> Result<(u8, u32, u32, u32)> {
     let lock = d_read(b, DEMOD_S, 0xC3)?;
     let mut x = [0u8; 3];
     b.i2c_write_read(DEMOD_S, &[0xBC], &mut x[..2])?;
@@ -517,7 +543,7 @@ pub(crate) fn sample_s(b: &mut impl Bus) -> Result<(u8, u32, u32, u32)> {
 
 /// ISDB-T demod sample for the live signal level: lock 0x80 (0 = locked) and the 3-byte
 /// C/N at 0x8B. (lock, cn_raw).
-pub(crate) fn sample_t(b: &mut impl Bus) -> Result<(u8, u32)> {
+pub fn sample_t(b: &mut impl Bus) -> Result<(u8, u32)> {
     let lock = d_read(b, DEMOD_T, 0x80)?;
     let mut x = [0u8; 3];
     b.i2c_write_read(DEMOD_T, &[0x8B], &mut x)?;
@@ -531,27 +557,39 @@ fn be24(x: [u8; 3]) -> u32 {
 /// Lock and C/N right after a tune. The real C/N: the TC90522 CNR is the 3-byte value
 /// at demod reg 0x8B (ISDB-T) / the 2-byte value at 0xBC (ISDB-S), run through the
 /// polynomial fits (an older reading of the single byte 0x82 as dB showed ~108).
-pub(crate) fn read_status(b: &mut impl Bus, sys: System) -> Result<Status> {
-    let mut st = Status::default();
-    match sys {
-        System::Terrestrial => {
-            st.locked = d_read(b, DEMOD_T, 0x80).unwrap_or(0xFF) == 0x00;
-            let mut cn = [0u8; 3];
-            if b.i2c_write_read(DEMOD_T, &[0x8B], &mut cn).is_ok() {
-                st.raw = be24(cn);
-                st.cn_mdb = cn_t_mdb(st.raw);
-            }
-        }
-        System::Satellite => {
-            st.locked = d_read(b, DEMOD_S, 0xC3).unwrap_or(0xFF) == 0x00;
-            let mut cn = [0u8; 2];
-            if b.i2c_write_read(DEMOD_S, &[0xBC], &mut cn).is_ok() {
-                st.raw = u32::from(u16::from_be_bytes(cn));
-                st.cn_mdb = cn_s_mdb(st.raw);
-            }
-        }
+pub fn read_status(b: &mut impl Bus, sys: System) -> Result<Status> {
+    let mut st = Status {
+        locked: match sys {
+            System::Terrestrial => d_read(b, DEMOD_T, 0x80).unwrap_or(0xFF) == 0x00,
+            System::Satellite => d_read(b, DEMOD_S, 0xC3).unwrap_or(0xFF) == 0x00,
+        },
+        ..Status::default()
+    };
+    if let Ok((raw, cn_mdb)) = read_cn(b, sys) {
+        st.raw = raw;
+        st.cn_mdb = cn_mdb;
     }
     Ok(st)
+}
+
+/// Read the C/N alone, in one I2C transfer: its raw register value and the C/N in 0.001 dB.
+/// Half of [`read_status`], for a caller that must not hold the bus long (the raw-TS stream
+/// loop, which cannot pump the TS while it reads).
+pub fn read_cn(b: &mut impl Bus, sys: System) -> Result<(u32, i32)> {
+    match sys {
+        System::Terrestrial => {
+            let mut cn = [0u8; 3];
+            b.i2c_write_read(DEMOD_T, &[0x8B], &mut cn)?;
+            let raw = be24(cn);
+            Ok((raw, cn_t_mdb(raw)))
+        }
+        System::Satellite => {
+            let mut cn = [0u8; 2];
+            b.i2c_write_read(DEMOD_S, &[0xBC], &mut cn)?;
+            let raw = u32::from(u16::from_be_bytes(cn));
+            Ok((raw, cn_s_mdb(raw)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -644,6 +682,19 @@ mod tests {
     #[test]
     fn power_on_sequence() {
         assert_eq!(rec(|b| power_on_init(b).unwrap()), POWER_ON);
+    }
+
+    #[test]
+    fn read_s_and_t_surface_the_lock_registers() {
+        let mut b = Rec::default();
+        // The lock registers read 0 in the mock (= locked); the wrappers pass that through.
+        assert_eq!(read_t(&mut b, 0x80), 0x00, "DEMOD_T 0x80 bit7 clear = terr lock");
+        assert_eq!(read_s(&mut b, 0xC3), 0x00, "DEMOD_S 0xC3 == 0 = sat lock");
+        // Any other register reads the mock's 0x5A -- i.e. not locked.
+        assert_eq!(read_t(&mut b, 0x10), 0x5A);
+        assert_eq!(read_s(&mut b, 0x10), 0x5A);
+        // The reads go to the two demod slaves (0x20 terr, 0x22 sat), one byte each.
+        assert_eq!(b.0, " R20=80/1 R22=c3/1 R20=10/1 R22=10/1");
     }
 
     #[test]
@@ -789,5 +840,21 @@ mod tests {
         assert_eq!((st.raw, st.cn_mdb), (0x5A5A, cn_s_mdb(0x5A5A)));
         let st = read_status(&mut r, System::Terrestrial).unwrap();
         assert_eq!((st.raw, st.cn_mdb), (0x5A5A5A, cn_t_mdb(0x5A5A5A)));
+    }
+
+    #[test]
+    fn cn_alone_is_one_transfer() {
+        let mut r = Rec::default();
+        assert_eq!(
+            read_cn(&mut r, System::Satellite).unwrap(),
+            (0x5A5A, cn_s_mdb(0x5A5A))
+        );
+        assert_eq!(r.0, " R22=bc/2");
+        let mut r = Rec::default();
+        assert_eq!(
+            read_cn(&mut r, System::Terrestrial).unwrap(),
+            (0x5A5A5A, cn_t_mdb(0x5A5A5A))
+        );
+        assert_eq!(r.0, " R20=8b/3");
     }
 }

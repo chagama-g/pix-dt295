@@ -19,7 +19,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dt295::state::State;
-use dt295::{CardWatch, Device, System, TsSink};
+use dt295::{
+    CardWatch, Device, RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, System, TsSink, raw_stall_due,
+};
 use tracing::{info, warn};
 
 use super::conf::Conf;
@@ -50,19 +52,20 @@ const SILENT: Duration = Duration::from_secs(10);
 
 pub fn spawn(
     serial: String,
+    raw: bool,
     conf: Arc<Conf>,
 ) -> std::io::Result<(mpsc::Sender<Job>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let thread = thread::Builder::new()
         .name(format!("unit {serial}"))
-        .spawn(move || run(&serial, &conf, &rx))?;
+        .spawn(move || run(&serial, raw, &conf, &rx))?;
     Ok((tx, thread))
 }
 
-fn run(serial: &str, conf: &Conf, jobs: &Receiver<Job>) {
+fn run(serial: &str, raw: bool, conf: &Conf, jobs: &Receiver<Job>) {
     let span = tracing::info_span!("unit", serial);
     let _entered = span.enter();
-    let mut unit = Unit::new(serial, conf);
+    let mut unit = Unit::new(serial, raw, conf);
     let mut next = None;
     while !stopping() {
         unit.open_if_due();
@@ -111,6 +114,9 @@ fn yield_to_queued(job: Job, jobs: &Receiver<Job>, serial: &str) -> Job {
 struct Unit<'a> {
     serial: &'a str,
     conf: &'a Conf,
+    /// Blob-free raw-TS mode: no vendor firmware, the device streams the scrambled TS
+    /// (the host descrambles). Chosen per unit in the configuration.
+    raw: bool,
     dev: Option<Device>,
     state_path: PathBuf,
     /// What the state file holds (the journal also writes keys to it directly).
@@ -127,10 +133,11 @@ struct Unit<'a> {
 }
 
 impl<'a> Unit<'a> {
-    fn new(serial: &'a str, conf: &'a Conf) -> Self {
+    fn new(serial: &'a str, raw: bool, conf: &'a Conf) -> Self {
         Self {
             serial,
             conf,
+            raw,
             dev: None,
             state_path: conf.state_file(serial),
             state: State::default(),
@@ -152,6 +159,9 @@ impl<'a> Unit<'a> {
     /// Open the unit, hand it the state file's link keys and PSI, and boot it.
     fn open(&mut self) {
         self.next_open = Instant::now() + OPEN_RETRY;
+        if self.raw {
+            return self.open_raw();
+        }
         let mut dev = match Device::open_serial(self.serial) {
             Ok(dev) => dev,
             Err(dt295::Error::NoDevice) => {
@@ -200,11 +210,48 @@ impl<'a> Unit<'a> {
         }
     }
 
+    /// Open the unit cold and hold it: no vendor firmware, no boot, no secure session,
+    /// no state. The first tune does the blob-free cold bring-up; a later one retunes.
+    fn open_raw(&mut self) {
+        let dev = match Device::open_serial(self.serial) {
+            Ok(dev) => dev,
+            Err(dt295::Error::NoDevice) => {
+                if !self.absent_logged {
+                    info!("not connected; waiting for it");
+                    self.absent_logged = true;
+                }
+                return;
+            }
+            Err(e) => {
+                warn!("cannot open: {e}");
+                return;
+            }
+        };
+        self.absent_logged = false;
+        self.watch = None;
+        self.dev = Some(dev);
+        self.last_presence = Instant::now();
+        info!("opened (raw-TS, cold; no firmware)");
+    }
+
     /// Keep the session alive, notice an unplug, save what changed.
     fn idle(&mut self) {
         let Some(mut dev) = self.dev.take() else {
             return;
         };
+        if self.raw {
+            // no secure session to keep alive and no state to save; just notice an unplug
+            if self.last_presence.elapsed() >= PRESENCE_EVERY {
+                self.last_presence = Instant::now();
+                if !self.present() {
+                    info!("disconnected");
+                    self.next_open = Instant::now();
+                    return; // dropping `dev` closes it
+                }
+            }
+            self.dev = Some(dev);
+            return;
+        }
         dev.idle_tick();
         if self.last_presence.elapsed() >= PRESENCE_EVERY {
             self.last_presence = Instant::now();
@@ -246,6 +293,9 @@ impl<'a> Unit<'a> {
 
     /// Serve one request; returns a request that took the unit over meanwhile.
     fn serve(&mut self, job: Job, jobs: &Receiver<Job>) -> Option<Job> {
+        if self.raw {
+            return self.serve_raw(job, jobs);
+        }
         let Job { req, mut conn } = job;
         if self.dev.is_none() {
             self.open();
@@ -424,8 +474,177 @@ impl<'a> Unit<'a> {
         takeover
     }
 
+    /// Serve one request in blob-free raw-TS mode: bring the chip up cold (once per
+    /// plug) or retune, and stream the scrambled TS to the client. No firmware, no
+    /// secure session, no state, no B-CAS (the host descrambles).
+    fn serve_raw(&mut self, job: Job, jobs: &Receiver<Job>) -> Option<Job> {
+        let Job { req, mut conn } = job;
+        if self.dev.is_none() {
+            self.open();
+        }
+        let Some(mut dev) = self.dev.take() else {
+            let why = format!("unit {} is not connected", self.serial);
+            let _ = reply(&mut conn, &Reply::Error(why));
+            return None;
+        };
+
+        let t0 = Instant::now();
+        let (pipe, queue) = Pipe::new();
+        if let Err(why) = start_raw(&mut dev, &req, pipe.sink()) {
+            warn!("{}: {why}", req.to_line());
+            let _ = reply(&mut conn, &Reply::Error(why));
+            self.dev = Some(dev);
+            return None;
+        }
+        // the cold bootstrap takes about 10 s; wait (bounded) for the first TS
+        if !wait_raw_ts(&dev, &pipe, RAW_FIRST_TS) {
+            // The worker ends on its own, in about a tune's time: with nothing (Ok) when the
+            // demod does not lock, with the error when the bring-up fails. Only a worker
+            // still running at the deadline waited the whole time. "no lock" is also what a
+            // channel scan skips quietly.
+            let running = dev.raw_running();
+            let why = match (running, dev.stream_stop_raw()) {
+                (false, Ok(_)) => "no lock".to_owned(),
+                (false, Err(e)) => format!("the cold bring-up failed: {e}"),
+                (true, Ok(_)) => format!("no TS within {RAW_FIRST_TS:?}"),
+                (true, Err(e)) => {
+                    format!("no TS within {RAW_FIRST_TS:?}, and the stream worker failed: {e}")
+                }
+            };
+            warn!("{}: {why}", req.to_line());
+            let _ = reply(&mut conn, &Reply::Error(why));
+            self.dev = Some(dev);
+            return None;
+        }
+        info!(
+            "{}: streaming raw-TS ({} ms)",
+            req.to_line(),
+            t0.elapsed().as_millis()
+        );
+        if reply(&mut conn, &Reply::Ok).is_err() {
+            pipe.closed.store(true, Ordering::Release); // the client is gone already
+        }
+        let shutter = conn.try_clone().ok();
+        let writer = {
+            let pipe = Arc::clone(&pipe);
+            thread::Builder::new()
+                .name(format!("unit {} writer", self.serial))
+                .spawn(move || write_ts(&pipe, &queue, conn))
+        };
+        if writer.is_err() {
+            pipe.closed.store(true, Ordering::Release);
+        }
+
+        let t_stream = Instant::now();
+        let mut takeover = None;
+        let mut unplugged = false;
+        let mut stall: Option<(u64, Instant)> = None;
+        // Consecutive restarts that delivered no TS (off air / no lock): back off a little each
+        // time, up to a few seconds, so a dead channel does not spin re-tuning every ~2 s.
+        let mut idle_restarts = 0u32;
+        let end = loop {
+            if stopping() {
+                break "the daemon stops";
+            }
+            if pipe.closed.load(Ordering::Acquire) || shutter.as_ref().is_some_and(peer_closed) {
+                break "the client went away";
+            }
+            match jobs.try_recv() {
+                Ok(mut job) if job.req.if_free => {
+                    info!("{}: refused, the unit is streaming", job.req.to_line());
+                    let why = format!("unit {} is streaming", self.serial);
+                    let _ = reply(&mut job.conn, &Reply::Busy(why));
+                }
+                Ok(job) => {
+                    takeover = Some(job);
+                    break "a new request takes the unit over";
+                }
+                Err(TryRecvError::Disconnected) => break "the daemon stops",
+                Err(TryRecvError::Empty) => {}
+            }
+            // the worker owns the device while streaming, so never touch it here. It ends
+            // on its own on a capture fault or an unplug (no proto access, no needs_recovery).
+            if !dev.raw_running() {
+                let ended = dev.stream_stop_raw();
+                if !self.present() {
+                    unplugged = true;
+                    break "the unit was unplugged";
+                }
+                let bytes = match ended {
+                    Ok(s) => s.bytes,
+                    Err(e) => {
+                        warn!("raw-TS: the stream worker failed: {e}");
+                        0
+                    }
+                };
+                if bytes == 0 {
+                    // No TS flowed (no lock / off air): back off (up to 5 s) so a dead channel
+                    // does not spin re-tuning and spamming the log every couple of seconds.
+                    idle_restarts = (idle_restarts + 1).min(5);
+                    thread::sleep(Duration::from_secs(u64::from(idle_restarts)));
+                } else {
+                    idle_restarts = 0;
+                }
+                warn!("raw-TS: the stream worker ended ({bytes} bytes); restarting the channel");
+                if let Err(why) = start_raw(&mut dev, &req, pipe.sink()) {
+                    warn!("{}: {why}", req.to_line());
+                    break "the worker ended and the restart failed";
+                }
+                stall = None;
+                continue;
+            }
+            // a halt never faults the worker: the only stall signal is the byte count not
+            // advancing. Restart the channel (stop + retune); a transient stall recovers.
+            if raw_stall_due(&mut stall, pipe.bytes.load(Ordering::Relaxed), Instant::now()) {
+                warn!("raw-TS: no TS for {RAW_STALL:?} while streaming; restarting the channel");
+                if let Err(e) = dev.stream_stop_raw() {
+                    // The stalled worker would not stop (it still holds the device I/O); the
+                    // start_raw below would block on it. End the stream; a re-plug is the reset.
+                    warn!("raw-TS: could not stop the stalled worker ({e}); ending");
+                    break "the stalled worker would not stop";
+                }
+                if let Err(why) = start_raw(&mut dev, &req, pipe.sink()) {
+                    warn!("{}: {why}", req.to_line());
+                    break "the datapath stalled and the restart failed";
+                }
+                continue;
+            }
+            thread::sleep(POLL);
+        };
+        if let Err(e) = dev.stream_stop_raw() {
+            warn!("raw stream stop failed: {e}");
+        }
+        pipe.finish();
+        if let Some(conn) = &shutter {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+        }
+        if let Ok(writer) = writer {
+            let _ = writer.join();
+        }
+        let bytes = pipe.bytes.load(Ordering::Relaxed);
+        let dropped = pipe.dropped.load(Ordering::Relaxed);
+        info!(
+            "raw stream ended after {:.1} s ({end}): {bytes} bytes{}",
+            t_stream.elapsed().as_secs_f64(),
+            if dropped > 0 {
+                format!(", {dropped} dropped (the client did not read in time)")
+            } else {
+                String::new()
+            }
+        );
+        if unplugged {
+            info!("disconnected");
+            self.next_open = Instant::now();
+        } else {
+            self.dev = Some(dev);
+        }
+        takeover
+    }
+
     fn close(&mut self) {
-        if let Some(mut dev) = self.dev.take() {
+        if let Some(mut dev) = self.dev.take()
+            && !self.raw
+        {
             self.save(&mut dev);
         }
     }
@@ -473,6 +692,47 @@ fn start(dev: &mut Device, req: &Request, sink: TsSink) -> Result<(), String> {
     dev.set_service_id(req.sid);
     dev.stream_start(sink)
         .map_err(|e| format!("stream start: {e}"))
+}
+
+/// Blob-free raw-TS: bring the chip up cold (once per plug) or retune, and stream the
+/// scrambled TS into `sink`. No vendor firmware, no secure session.
+fn start_raw(dev: &mut Device, req: &Request, sink: TsSink) -> Result<(), String> {
+    // A previous worker that would not stop still holds the device I/O; cold_monitor_installed
+    // (and the stream start) below would block on its lock forever. Refuse instead of
+    // deadlocking; a re-plug is the reset. Covers the initial tune and every restart path.
+    if dev.raw_present() {
+        return Err("the previous raw-TS worker has not stopped; re-plug the unit".to_owned());
+    }
+    let (terrestrial, hz, tsid) = match req.tuning {
+        Tuning::Terrestrial { hz } => (true, hz, None),
+        Tuning::Satellite { hz, tsid } => {
+            (false, hz, (tsid != dt295::chan::NO_TSID).then_some(tsid))
+        }
+    };
+    // Decide the bring-up from the chip, not a flag: our monitor BODY persists across a
+    // retune and a reopen, and clears only when a re-plug wipes RAM. The first tune after
+    // a cold open does the whole bring-up; a later one only retunes + rearms. A "TS
+    // flowed" flag would mark an off-air-but-brought-up chip cold and re-run the
+    // once-per-plug bootstrap, which faults. (Same reasoning as the BonDriver.)
+    let full = !dev.cold_monitor_installed();
+    dev.stream_start_cold(terrestrial, hz, tsid, full, RAW_STREAM_CAP, sink)
+        .map_err(|e| format!("raw stream start: {e}"))
+}
+
+/// Wait (bounded) for the raw worker to deliver the first TS, or until it ends (a fault
+/// or an unplug before any TS). `pipe.bytes` is monotonic.
+fn wait_raw_ts(dev: &Device, pipe: &Pipe, within: Duration) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < within {
+        if pipe.bytes.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        if !dev.raw_running() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    pipe.bytes.load(Ordering::Relaxed) > 0
 }
 
 fn reply(conn: &mut UnixStream, r: &Reply) -> std::io::Result<()> {

@@ -114,7 +114,7 @@ fn target(a: &CaptureArgs, ini: Option<&BonDriver>) -> Result<(Target, Option<u1
 fn conf_device_args(conf: &Conf, given: &DeviceArgs) -> Result<DeviceArgs> {
     let serial = match (&given.serial, conf.units.as_slice()) {
         (Some(s), _) => s.clone(),
-        (None, [only]) => only.clone(),
+        (None, [only]) => only.serial.clone(),
         (None, units) => bail!(
             "which unit? the configuration has {}: give --serial",
             units.len()

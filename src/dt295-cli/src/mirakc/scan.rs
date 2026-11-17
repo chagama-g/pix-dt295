@@ -181,7 +181,7 @@ const SDT_READ: Duration = Duration::from_secs(16);
 const SERVICE_READ: Duration = Duration::from_secs(4);
 /// The daemon may boot the unit before it answers.
 #[cfg(unix)]
-const REPLY_WAIT: Duration = Duration::from_secs(60);
+const REPLY_WAIT: Duration = Duration::from_mins(1);
 
 /// The scan: the channels, and what was left out (and why).
 #[cfg(unix)]
@@ -228,7 +228,7 @@ pub(super) fn run(
         };
         tables.extend(psi.tables());
         if let Some(other) = second_ts(onid, tsid, &tables) {
-            let hz = transponder(onid, other).map_or(0, |t| t.if_khz * 1000);
+            let hz = transponder(onid, other).map_or_default(|t| t.if_khz * 1000);
             let tuning = Tuning::Satellite { hz, tsid: other };
             if let Tuned::Stream(psi) = tune(socket, serial, tuning, None, SDT_READ, whole)? {
                 tables.extend(psi.tables());
@@ -241,7 +241,7 @@ pub(super) fn run(
                 continue;
             };
             if on_air {
-                let hz = transponder(onid, tsid).map_or(0, |t| t.if_khz * 1000);
+                let hz = transponder(onid, tsid).map_or_default(|t| t.if_khz * 1000);
                 let tuning = Tuning::Satellite { hz, tsid };
                 let streams = |psi: &Psi, _: Duration| psi.pat.is_some();
                 match tune(socket, serial, tuning, Some(sid), SERVICE_READ, streams)? {

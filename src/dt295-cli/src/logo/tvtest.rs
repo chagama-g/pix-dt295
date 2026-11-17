@@ -258,8 +258,7 @@ pub(super) fn set_logo_ids(text: &str, ids: &BTreeMap<u32, (u16, bool)>) -> (Str
     let is_header = |l: &str| l.trim_start().starts_with('[');
     let section = lines.iter().position(|l| {
         l.trim()
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
+            .strip_circumfix('[', ']')
             .is_some_and(|s| s.trim().eq_ignore_ascii_case(ID_MAP_SECTION))
     });
     let start = match section {
@@ -385,15 +384,10 @@ impl Store {
         let data = tv
             .dir
             .join(tv.get("LogoDataFileName").unwrap_or("LogoData"));
-        let mut id_map = data.clone().into_os_string();
-        id_map.push(".ini");
+        let id_map = data.with_added_extension("ini");
         let dir = tv.dir.join(tv.get("LogoDirectory").unwrap_or("Logo"));
         let dir = (tv.yes("SaveRawLogo") || dir.is_dir()).then_some(dir);
-        Ok(Self {
-            data,
-            id_map: id_map.into(),
-            dir,
-        })
+        Ok(Self { data, id_map, dir })
     }
 
     pub(super) fn load_data(&self) -> Result<LogoData> {
@@ -420,7 +414,7 @@ impl Store {
             }
         };
         let utf16 = old.as_deref().is_some_and(|b| b.starts_with(b"\xFF\xFE"));
-        let text = old.as_deref().map(decode_text).unwrap_or_default();
+        let text = old.as_deref().map_or_default(decode_text);
         let (text, added, changed) = set_logo_ids(&text, &report.id_map);
         if added + changed > 0 {
             replace_file(&self.id_map, &encode_text(&text, utf16))?;
@@ -483,16 +477,8 @@ pub(super) fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// A text file as TVTest writes them: UTF-16 LE with a BOM, or UTF-8 / ASCII.
 pub(super) fn decode_text(b: &[u8]) -> String {
     match b.strip_prefix(b"\xFF\xFE") {
-        Some(rest) => {
-            let units: Vec<u16> = rest
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&c| u16::from_le_bytes(c))
-                .collect();
-            String::from_utf16_lossy(&units)
-        }
-        None => String::from_utf8_lossy(b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(b)).into_owned(),
+        Some(rest) => String::from_utf16le_lossy(rest),
+        None => String::from_utf8_lossy(b.trim_prefix(b"\xEF\xBB\xBF")).into_owned(),
     }
 }
 

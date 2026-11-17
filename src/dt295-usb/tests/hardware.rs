@@ -1,6 +1,7 @@
 //! Hardware smoke test: needs a PIX-DT295 (bound to WinUSB on Windows) that no other
 //! process is using. Run with `cargo test -p dt295-usb -- --ignored`.
 
+use std::assert_matches;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,7 @@ fn smoke() {
         thread::sleep(Duration::from_millis(300));
         dev.abort_pipe(EP_TS).expect("abort");
         let (r, took) = reader.join().expect("reader thread");
-        assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+        assert_matches!(r, Err(Error::Cancelled));
         assert!(took < Duration::from_secs(2), "abort took {took:?}");
     });
 }

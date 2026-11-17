@@ -101,14 +101,12 @@ fn quote_arg(arg: &str) -> String {
 }
 
 pub fn run(cmd: &DriverCommand) -> anyhow::Result<()> {
-    #[cfg(windows)]
-    {
-        win::run(cmd)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = cmd;
-        anyhow::bail!("dt295 driver is only on Windows (on Linux, see the udev rule in INSTALL.md)")
+    cfg_select! {
+        windows => win::run(cmd),
+        _ => {
+            let _ = cmd;
+            anyhow::bail!("dt295 driver is only on Windows (on Linux, see the udev rule in INSTALL.md)")
+        }
     }
 }
 

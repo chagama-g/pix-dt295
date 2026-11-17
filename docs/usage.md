@@ -32,17 +32,18 @@ DLL と同じフォルダーに、同じ名前 (拡張子だけ `.ini`) で置�
 |---|---|---|
 | `[Tuner] Firmware` | `mb86m01_assp_osec_idle.bin` | 起動用のファームウェア |
 | `[Tuner] TrcFirmware` | `mb86m01_assp_osec_trc_m_h.bin` | トランスコーダーのファームウェア。無いとストリームが始まらない |
+| `[Tuner] RawTS` | 0 | `1` で raw-TS モード (完全に自前コードのみ)。レジデント (チップに常駐させる第三者のコード) も補助コア (demod を動かす副 CPU) も純正ファームも使わず、ホストがチップを起こし、ホスト面の I2C で選局し、取り込みエンジンを設定して自前の pump で配信する。スクランブルされた TS をそのまま出し、B-CAS の解除は TVTest の CAS プラグイン (PC 側) に任せる。`0` (既定) は `Firmware`/`TrcFirmware` で動かし内蔵リーダーで解除する通常モード。最初の選局は cold (電源投入直後) の個体が必要 |
 | `[Tuner] DeviceIndex` | 0 | 複数台のときに使う個体の番号 (0 から)。開ける個体 (WinUSB で、ほかのプログラムが使っていない個体) のみを数えるので、片方が使用中だと番号がずれる |
 | `[Tuner] DeviceSerial` | なし | 使う個体の USB シリアル番号 (例 `CD23456789`。大文字小文字は区別しない)。`DeviceIndex` より優先し、つないだ順番に関係なくその個体を使用。`dt295 list` で確認可能 (1 台ずつ挿して確認し、本体にラベルを貼っておくとよい)。デバイス マネージャーの「デバイス インスタンス パス」 (`USB\VID_06B8&PID_103B\<シリアル番号>`) の末尾でも可 |
-| `[Tuner] UHF` / `CATV` | 1 / 1 | 地デジのチューニング空間 (UHF 13-62ch、CATV C13-C63) を表示するか |
+| `[Tuner] UHF` / `CATV` | 1 / 1 | 地デジのチューニング空間 (UHF 13-62ch, CATV C13-C63) を表示するか |
 | `[Tuner] LogFile` | 0 | `1` で DLL と同じ名前の `.log` にログを出力。前回の分は `.log.1` に保存。ログは DebugView (`OutputDebugString`) にも常に出力 |
-| `[Tuner] LogLevel` | `info` | ログの詳しさ: `error`、`warn`、`info`、`debug`、`trace` (大文字小文字は区別しない)。ほかの値なら `info` とし、その旨をログに出力 |
+| `[Tuner] LogLevel` | `info` | ログの詳しさ: `error`, `warn`, `info`, `debug`, `trace` (大文字小文字は区別しない)。ほかの値なら `info` とし、その旨をログに出力 |
 | `[Tuner] StateFile` | DLL と同じ名前の `.state` | 状態ファイル (デバイスのリンク鍵と衛星の PSI を保存)。空か行が無ければ DLL と同じ名前。無効化は不可 (無いと再オープンで復号できず、未契約のチャンネルがスキャンから漏れる)。消すと自動で再作成 |
-| `[BS]` / `[CS110]` | なし | `名前=周波数 (kHz),TSID[,ServiceID]` を 1 行に 1 チャンネル。周波数は IF (衛星の周波数 - 10678 MHz)、TSID は放送の transport_stream_id (16 進は `0x` を付ける)。`ServiceID` を省くか -1 にすると、その TS の全サービス。1 行も無ければその空間は非表示 |
+| `[BS]` / `[CS110]` | なし | `名前=周波数 (kHz),TSID[,ServiceID]` を 1 行に 1 チャンネル。周波数は IF (衛星の周波数 - 10678 MHz), TSID は放送の transport_stream_id (16 進は `0x` を付ける)。`ServiceID` を省くか -1 にすると、その TS の全サービス。1 行も無ければその空間は非表示 |
 
 組み込みの周波数 (ISDB-T の中心周波数 = 帯域の中心 + 1/7 MHz。純正の表と同じ):
 - UHF 13-62ch: 473.142857 + (n-13)*6 MHz
-- CATV C13-C21: 111.142857 + (n-13)*6 MHz、C22: 167.142857 MHz、C23-C63: 225.142857 + (n-23)*6 MHz
+- CATV C13-C21: 111.142857 + (n-13)*6 MHz, C22: 167.142857 MHz, C23-C63: 225.142857 + (n-23)*6 MHz
 
 CATV は、地デジを CATV の周波数に変えて流すケーブルテレビ (周波数変換パススルー) 向け。
 UHF 51ch 以上 (700 MHz 以上。チューナーの設定がここで変わる) と CATV は、実機では確認していない。
@@ -50,11 +51,17 @@ UHF 51ch 以上 (700 MHz 以上。チューナーの設定がここで変わる)
 
 `[BS]` / `[CS110]` の行は、状態ファイルに溜まった SDT から `dt295 lineup` で作り直せる。
 
+raw-TS モード (`RawTS=1`) は、スクランブルされたままの TS を TVTest に渡し、TVTest 側の CAS プラグインで B-CAS を解除する方式。
+ファームウェアは要らず、ホストがチップを cold から自力で立ち上げる (完全に自前コードのみ)。
+最初の選局だけ cold の個体が必要で、そのあと TVTest を閉じて開き直すだけなら差し直しは要らない。
+通常モード (System1, 内蔵リーダーで解除) と raw-TS モードは `RawTS` だけで切り替わる。
+内部の仕組みと機能差は [raw-ts.md](raw-ts.md)。
+
 ## `dt295` コマンド
 
 | コマンド | 内容 |
 |---|---|
-| `dt295 list` | 接続中の個体の一覧 (DeviceIndex、シリアル番号、使用中かどうか) |
+| `dt295 list` | 接続中の個体の一覧 (DeviceIndex, シリアル番号, 使用中かどうか) |
 | `dt295 capture` | 個体を起動して選局し、TS をファイルか標準出力へ書き出し |
 | `dt295 state show` | 状態ファイルの内容の表示 |
 | `dt295 lineup` | 状態ファイルの SDT から ini の `[BS]` / `[CS110]` を再作成 |
@@ -71,7 +78,7 @@ UHF 51ch 以上 (700 MHz 以上。チューナーの設定がここで変わる)
 ### 共通事項
 
 - 個体は `--serial <シリアル番号>` か `-i <番号>` (`dt295 list` の index) で選択
-- `-v` で DEBUG、`-vv` で TRACE のログを標準エラー出力に出力する。
+- `-v` で DEBUG, `-vv` で TRACE のログを標準エラー出力に出力する。
   環境変数 `RUST_LOG` があればそちらが優先。
 - 失敗すると終了コード 1 (`dt295 lineup` のみ下のとおり)
 - Linux でデーモンを使わずに個体を開くには、udev のルールが必要 ([INSTALL.md](../INSTALL.md) の手順 4)。
@@ -85,7 +92,7 @@ index  serial        status  location
 ```
 
 使用中の個体は `busy` と表示され、index は付かない (`DeviceIndex` と `-i` は開ける個体だけを数える)。
-Windows では WinUSB になっていない個体も、Linux ではデーモンが開いている個体も `busy`。
+Windows では WinUSB になっていない個体も, Linux ではデーモンが開いている個体も `busy`。
 
 ### `dt295 capture`
 
@@ -95,16 +102,16 @@ dt295 capture --fw mb86m01_assp_osec_idle.bin --trc mb86m01_assp_osec_trc_m_h.bi
 dt295 capture --bondriver BonDriver_DT295.ini --channel BS15/TS1 -t 0 > bs.ts
 ```
 
-- 地デジは `--ter <Hz>`、衛星は `--sat <IF の Hz>` と `--tsid <16 進>`。
+- 地デジは `--ter <Hz>`, 衛星は `--sat <IF の Hz>` と `--tsid <16 進>`。
   `--tsid` を省くとその周波数の最初の TS、`--sid` を省くとその TS の全サービス。
 - `--all-services` は、`--channel` の行に `ServiceID` があっても TS の全サービスを出力
 - `-t` は秒数 (既定 10)、`-t 0` は止めるまで続ける。
   どの方法で止めても、ストリームを停止し、リンク鍵を状態ファイルに保存してから終了する。
   SIGKILL で強制終了されても、個体に残ったストリームは次の起動時に停止される。
 - `-o` を省くと標準出力へ書き出し (端末には出力しない)
-- `--bondriver <ini>` は BonDriver の ini からファームウェア、個体、状態ファイルを読み取り、コマンドラインでの指定が優先される。
+- `--bondriver <ini>` は BonDriver の ini からファームウェア, 個体, 状態ファイルを読み取り、コマンドラインでの指定が優先される。
   Linux でも同じ形式の ini を設定ファイルとして使える。
-- `--channel <名前>` は、`--bondriver` の ini の行の名前 (例 `BS15/TS1`)、地デジの `27ch`、CATV の `C13ch`。
+- `--channel <名前>` は、`--bondriver` の ini の行の名前 (例 `BS15/TS1`), 地デジの `27ch`, CATV の `C13ch`。
   大文字小文字は区別しない。
 - `--state <ファイル>` は、その状態ファイルのリンク鍵を使い、検証できた鍵を書き戻す。
   TVTest と交互に使うときは、BonDriver の `.state` を渡す (下の "困ったとき" セクション)。
@@ -129,7 +136,7 @@ dt295 lineup BonDriver_DT295.state --bondriver BonDriver_DT295.ini          # in
 dt295 lineup BonDriver_DT295.state --bondriver BonDriver_DT295.ini --write  # ini を書き換える (.bak を残す)
 ```
 
-- 状態ファイルに溜まった SDT から、TV、音声のみ、データ放送のサービスのある TS を 1 TS 1 行で出力する。
+- 状態ファイルに溜まった SDT から、TV, 音声のみ, データ放送のサービスのある TS を 1 TS 1 行で出力する。
   `--per-service` を付けると、1 サービス 1 行 (`ServiceID` 付き)。
   SDT は TVTest で BS / CS を視聴したりスキャンしたりすると溜まるので、ひととおり視聴してから使う。
 - 行の上のコメントのサービス名は、状態ファイルと同じ名前の `.ch2` から取得 (`--ch2 <ファイル>` で指定、`--ch2 -` で使わない)
@@ -172,10 +179,10 @@ dt295 logo --tvtest C:\TVTest --schedule                # 毎日 03:55 に実行
 dt295 logo --unschedule                                 # 毎日の実行を解除する
 ```
 
-空いている個体で 929 を選局し、ロゴがそろったら個体を解放して、TVTest のロゴファイル (`LogoData`、`LogoData.ini`、`Logo` フォルダー) に追加する。
+空いている個体で 929 を選局し、ロゴがそろったら個体を解放して、TVTest のロゴファイル (`LogoData`, `LogoData.ini`, `Logo` フォルダー) に追加する。
 書き換える前の `LogoData` と `LogoData.ini` は `.bak` に残る。
 
-- 個体、ファームウェア、状態ファイルは、TVTest の BonDriver のフォルダーにある `BonDriver_DT295*.ini` から読み取る。
+- 個体, ファームウェア, 状態ファイルは、TVTest の BonDriver のフォルダーにある `BonDriver_DT295*.ini` から読み取る。
   視聴中の個体は使わない。
   `DeviceSerial` の個体が空いていなければ、ほかの空いている個体を状態ファイル無しで使う (直前に別のソフトが使っていた個体だと復号できないことがある)。
   `--serial <シリアル番号>` でその個体のみを使う。
@@ -251,6 +258,7 @@ channels:                       # ここから下が dt295 mirakc-channels の�
   mirakc は同じ TS のサービスを 1 台のチューナーでまとめて扱うので、同じ TS の番組の同時録画ができる。
 - `--per-service` を付けると、1 サービスで 1 チャンネル (`extra-args` に `--sid`)
 - mirakc のサービスの ID はチャンネルの構成によらないので、作り直しても変わらない
+- raw-TS モード (`raw-ts = true` の個体) のときは、チューナーを `decoded: false` にして `filters.decode-filter` に解除ツールを設定する (上の "`dt295 serve`" の "raw-TS モード")
 - `--scan` は録画ソフトが個体を使っていないときに実行する (使われていたら奪わずに失敗する)。
   UHF を 1 つずつ選局し (`--catv` で CATV も)、衛星は TS を 2 つずつ選局して SDT から全サービスを集める。
   BS の予備のサービスも、スキャン時に放送していなくても含まれる。
@@ -288,10 +296,16 @@ socket = /run/dt295/dt295.sock
 
 ; 使う個体ごとに 1 つ (シリアル番号は dt295 list で分かる)
 [unit AB12345678]
+
+; raw-ts = true でその個体を raw-TS モード (完全に自前コードのみ) にする
+[unit CD23456789]
+raw-ts = true
 ```
 
 - `[dt295]` の 3 つは省略できる (上の値が既定)。
   未知のセクションやキーはエラーになる。
+- `[unit ...]` の `raw-ts` は既定 `false` (System1, 内蔵カードで解除)。
+  `true` にするとその個体は純正ファーム無しでスクランブルされたままの TS を出し、解除はホスト側に任せる (下の "raw-TS モード")
 - コメント (`;` か `#`) は行頭に書く。
   値の後ろに書くと値の一部になる。
 - `dt295 serve -c <ファイル>` で別の設定ファイルを読み込み
@@ -300,6 +314,32 @@ socket = /run/dt295/dt295.sock
 - 個体が抜かれたら閉じて、挿し直されたら再オープンする。
   ファームウェアが止まっていたら、選局の前に再初期化する。
   ストリーム中に止まったら、起動し直して同じクライアントに送り続ける (3 秒ほど途切れる)。
+
+#### raw-TS モード (完全に自前コードのみ)
+
+個体に `raw-ts = true` を書くと、その個体は純正ファームを一切使わず、ホストがチップを cold (電源投入直後) から起こしてスクランブルされたままの TS を出す。
+B-CAS の解除は、録画ソフトのパイプラインに置いた外部ツールと、ホストに挿した PC/SC リーダーの契約済みカードで行う (内部の仕組みと機能差は [raw-ts.md](raw-ts.md)、導入は [INSTALL.md](../INSTALL.md) の "Linux: raw-TS モード")。
+
+- ファームウェア (`firmware-dir`) も内蔵スロットの B-CAS カードも使わない
+- 最初の選局は cold の個体が要る。
+  デーモンが個体を開いたまま保持するので、以降のチャンネル変更は retune だけで速い。
+  物理的に抜き挿しすると、次の選局で改めて cold から立ち上げる
+- ストリームが止まったら、同じチャンネルを選局し直す (System1 のようなファームの再初期化はしない)
+- mirakc では、チューナーを `decoded: false` にし、`filters.decode-filter` に解除ツールを設定する:
+
+  ```yaml
+  tuners:
+    - name: dt295-CD23456789
+      types: [GR, BS, CS]
+      command: dt295 tune --serial CD23456789 {{{extra_args}}}
+      decoded: false              # スクランブルされたまま出すので mirakc 側で解除する
+  filters:
+    decode-filter:
+      command: /usr/bin/b25 /dev/stdin /dev/stdout
+  ```
+
+  libarib25 の `b25` は `-` (標準入出力の意味) を受け付けないので、`/dev/stdin /dev/stdout` を渡す。
+  解除には pcscd (pcsc-lite) とリーダーのカードが要る
 
 ### `dt295 tune` (Linux)
 
@@ -343,7 +383,7 @@ DLL の ini、状態ファイル、ログがそのまま使われる。
 
 ## 困ったとき
 
-- 使っているバージョンの確認: `dt295 --version`、DLL はプロパティの詳細タブの製品バージョンか、ログの先頭の `version` の行
+- 使っているバージョンの確認: `dt295 --version`, DLL はプロパティの詳細タブの製品バージョンか, ログの先頭の `version` の行
 - TS が出ない、スキャンで何も見つからない: カードが挿さっているか、`TrcFirmware` のファイルがあるかを確認する。
   ログ (`LogFile=1`) の `SetChannel ... LOCK / nolock` と `s1 worker: delivered ...` を確認する。
 - ログに `firmware stopped acking commands` や `the firmware faulted`: ファームウェアが応答しなくなった。
@@ -355,6 +395,9 @@ DLL の ini、状態ファイル、ログがそのまま使われる。
   ログに `b-cas: card state 5 into the stream` が出るときは、カードの接触不良なので挿し直す。
 - 長時間使った後に TS が欠ける、または出ない: USB を抜き挿しすると復旧する。
   TVTest は開いたままでよい (挿し直すと自動で再オープンし、同じチャンネルを再選局する)。
+- raw-TS モードで、ログに `no pump for ... ms` や `continuity gaps` の WARN が出る (Linux): 非力な機器で pump が間に合わず、TS が欠けている。
+  `systemctl edit dt295` で `[Service]` に `LimitRTPRIO=1` と `LimitNICE=-10` を追加し、デーモンを再起動する。
+  優先度が上がったかは、ログの `raw-TS cold: stream thread at ...` の行で確認できる。
 - 同じ個体を別の名前の DLL や `dt295 capture` と交互に使うと復号できない (ログに `no decodable PAT -- the link key does not match`): デバイスは、前のプロセスの終了から 1 分ほどでセキュアセッションが切れるまで、最初に渡されたリンク鍵で暗号化し続ける。
   鍵は状態ファイルに残るので、別の名前の DLL どうしは `StateFile` で同じファイルを指定し、`dt295 capture` には `--state` で TVTest の状態ファイルを渡す。
   抜き挿しでも直る。

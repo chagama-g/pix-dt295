@@ -11,10 +11,13 @@
 //! * [`CardWatch`] -- when a host should start a stream over for the B-CAS card;
 //!   [`StallWatch`] -- for a firmware that stopped acking.
 //!
+//! The hardware primitives (register / command protocol, I2C, front end, firmware
+//! download, shared types) live in the `dt295-core` crate and the blob-free raw-TS
+//! path in `dt295-rawfw`; both are re-exported here so the public API is unchanged.
+//!
 //! Logging uses `tracing`; the host installs the subscriber.
 
-pub mod chan;
-pub mod error;
+pub mod ch2;
 pub mod state;
 pub mod ts;
 
@@ -22,17 +25,14 @@ mod auth;
 mod cas;
 mod device;
 mod dtvdec;
-mod fe1;
 mod fw;
-mod i2c;
-mod proto;
 mod s1;
-mod signal;
 mod watch;
 
 pub use device::{Device, KeyJournal, Live};
+pub use dt295_core::{Error, Result, Status, System, TsSink, chan, error};
+pub use dt295_rawfw::{RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, RawCaptureStats, raw_stall_due};
 pub use dt295_usb::Listed;
-pub use error::{Error, Result};
 pub use watch::{CardWatch, StallWatch, StartOver};
 
 /// The present PIX-DT295 units with their USB serial numbers, in the order
@@ -46,29 +46,6 @@ pub fn list() -> Result<Vec<Listed>> {
 pub fn present_serials() -> Result<Vec<String>> {
     Ok(dt295_usb::present_serials(dt295_usb::VID, dt295_usb::PID)?)
 }
-
-/// Broadcast system of a tune.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum System {
-    /// ISDB-T (terrestrial, CATV pass-through).
-    Terrestrial,
-    /// ISDB-S (BS / CS110).
-    Satellite,
-}
-
-/// Demodulator status read at tune time ([`Device::read_status`]).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Status {
-    pub locked: bool,
-    /// C/N in 0.001 dB.
-    pub cn_mdb: i32,
-    /// The raw C/N register value (for diagnostics).
-    pub raw: u32,
-}
-
-/// Receives the TS of a running stream, on the stream worker thread, in 188-byte
-/// packet multiples. Must not block for long (the device buffers only ~100 ms).
-pub type TsSink = Box<dyn FnMut(&[u8]) + Send + 'static>;
 
 /// One cached satellite PSI section ([`Device::psi_export`] / [`Device::psi_import`]).
 #[derive(Debug, Clone, PartialEq, Eq)]

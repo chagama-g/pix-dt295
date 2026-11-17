@@ -34,7 +34,7 @@ fn map_error(e: nusb::Error) -> Error {
     match e.kind() {
         ErrorKind::Disconnected | ErrorKind::NotFound => Error::NoDevice,
         ErrorKind::Busy | ErrorKind::PermissionDenied => Error::Access,
-        _ => Error::Io(e.os_error().map_or(0, |c| c as i32)),
+        _ => Error::Io(e.os_error().map_or_default(|c| c as i32)),
     }
 }
 
@@ -138,10 +138,6 @@ impl AnyEp {
 
     fn pending(&self) -> usize {
         each_ep!(self, e => e.pending())
-    }
-
-    fn allocate(&self, len: usize) -> Buffer {
-        each_ep!(self, e => e.allocate(len))
     }
 
     fn submit(&mut self, buf: Buffer) {
@@ -443,9 +439,13 @@ impl Device {
             Some(e) => e,
             None => AnyEp::open(&self.intf, ep)?,
         };
+        // Use heap buffers: usbfs mmap-backed buffers produced corrupt TS on
+        // Linux 4.9.44 (32-bit ARM), while heap buffers worked. This is consistent
+        // with known usbfs DMA mapping bugs on non-coherent systems; the exact
+        // cause in that kernel is unverified (upstream fix: 2bef9aed6f0e).
+        // These buffers are allocated here and reused by ReadQueue::next.
         for _ in 0..n {
-            let buf = e.allocate(size);
-            e.submit(buf);
+            e.submit(Buffer::new(size));
         }
         Ok(ReadQueue {
             ep: e,
@@ -519,62 +519,53 @@ impl Drop for ReadQueue<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
     fn request_type_splits() {
-        assert!(matches!(
+        assert_matches!(
             split_request_type(0xC0),
             Ok((ControlType::Vendor, Recipient::Device))
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             split_request_type(0x40),
             Ok((ControlType::Vendor, Recipient::Device))
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             split_request_type(0x21),
             Ok((ControlType::Class, Recipient::Interface))
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             split_request_type(0x02),
             Ok((ControlType::Standard, Recipient::Endpoint))
-        ));
-        assert!(
-            matches!(split_request_type(0x60), Err(Error::Param)),
-            "reserved type"
         );
-        assert!(
-            matches!(split_request_type(0x44), Err(Error::Param)),
+        assert_matches!(split_request_type(0x60), Err(Error::Param), "reserved type");
+        assert_matches!(
+            split_request_type(0x44),
+            Err(Error::Param),
             "reserved recipient"
         );
     }
 
     #[test]
     fn transfer_errors_map() {
-        assert!(matches!(
+        assert_matches!(
             map_transfer_error(TransferError::Cancelled),
             Error::Cancelled
-        ));
-        assert!(matches!(
-            map_transfer_error(TransferError::Stall),
-            Error::Stall
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(map_transfer_error(TransferError::Stall), Error::Stall);
+        assert_matches!(
             map_transfer_error(TransferError::Disconnected),
             Error::NoDevice
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             map_transfer_error(TransferError::InvalidArgument),
             Error::Param
-        ));
-        assert!(matches!(
-            map_transfer_error(TransferError::Unknown(5)),
-            Error::Io(5)
-        ));
-        assert!(matches!(
-            map_control_error(TransferError::Cancelled),
-            Error::Timeout
-        ));
+        );
+        assert_matches!(map_transfer_error(TransferError::Unknown(5)), Error::Io(5));
+        assert_matches!(map_control_error(TransferError::Cancelled), Error::Timeout);
     }
 
     #[test]

@@ -17,26 +17,69 @@ PIX-DT295 を Windows (TVTest) と Linux (mirakc + EPGStation) で使い始め�
   3c4721204a987a5e8a818be4ac14ee2709a4786413a7ef77ddb33573370dd9d3  mb86m01_assp_osec_idle.bin
   a3520f60e80f08008621dcf44679474906e43a4de36770d769cd7642b19ddd0b  mb86m01_assp_osec_trc_m_h.bin
   ```
-- ビルドに Rust 1.89 以上、Windows では MSVC も (BonDriver の C++ の shim 用)
+- ソースからビルドするときは Rust 1.100 以上、Windows では MSVC も (BonDriver の C++ の shim 用)
+
+## 入手
+
+[GitHub のリリース](https://github.com/smpn2/pix-dt295/releases) から、使う OS と CPU のファイルをダウンロードする。
+ソースからビルドするときは下の "ビルド" セクション。
+
+| OS | ファイル |
+|---|---|
+| Windows | `pix-dt295-<版>-windows-<CPU>.zip` (x64, x86, arm64) |
+| Debian / Ubuntu | `pix-dt295_<版>-1_<CPU>.deb` (amd64, i386, arm64, armhf) |
+| Fedora / RHEL 系 | `pix-dt295-<版>-1.<CPU>.rpm` (x86_64, i386, aarch64, armv7hl) |
+| Arch Linux | `pix-dt295-<版>-1-<CPU>.pkg.tar.zst` (x86_64, i686, aarch64, armv7h) |
+| そのほかの Linux | `pix-dt295-<版>-linux-<CPU>.tar.gz` (x86_64, i686, aarch64, armv7) |
+
+32bit 版の TVTest には x86 の zip を使う。
+Linux の `dt295` は静的リンクなので、ディストリビューションを問わない。
+
+ファイルはすべて GitHub Actions がタグのコミットからビルドしたもので、Sigstore で署名したビルドの来歴 (SLSA build provenance) が付いている。
+改ざんされていないことは [GitHub CLI](https://cli.github.com/) で確認できる:
+
+```
+gh attestation verify pix-dt295-0.2.0-windows-x64.zip --repo smpn2/pix-dt295
+```
+
+`Verification succeeded!` と、ビルドした workflow とコミットが表示されれば問題ない。
+タグと workflow まで照合するコマンドと `SHA256SUMS` の使い方は、リリースノートの "検証" セクションにある。
 
 ## ビルド
 
-Windows:
+### Windows
 
 ```
 cargo build --release                                   # x64: target\release\
 cargo build --release --target i686-pc-windows-msvc     # x86 (32bit 版の TVTest 用): target\i686-pc-windows-msvc\release\
+cargo build --release --target aarch64-pc-windows-msvc  # ARM64: target\aarch64-pc-windows-msvc\release\
 ```
 
 生成されるのは `BonDriver_DT295.dll`、`dt295.exe`、`bontest.exe` (BonDriver の動作確認用)。
 Visual C++ 再頒布可能パッケージは不要。
-x64 と x86 のターゲットは `rust-toolchain.toml` により自動で追加される。
 
-Linux (ビルドできるのは `dt295` コマンドのみ。USB には usbfs を直接使うので、libusb は不要):
+### Linux
+
+ビルドできるのは `dt295` コマンドのみ。USB には usbfs を直接使うので、libusb は不要。
 
 ```
-cargo build --release -p dt295-cli                                      # target/release/dt295
-cargo build --release -p dt295-cli --target x86_64-unknown-linux-musl   # 静的リンク (別のマシンやコンテナーで使うとき)
+cargo build --release -p dt295-cli                                          # target/release/dt295
+# 静的リンク (別のマシンやコンテナーで使うとき)
+cargo build --release -p dt295-cli --target x86_64-unknown-linux-musl       # x64
+cargo build --release -p dt295-cli --target i686-unknown-linux-musl         # x86
+cargo build --release -p dt295-cli --target aarch64-unknown-linux-musl      # ARM64
+cargo build --release -p dt295-cli --target armv7-unknown-linux-musleabihf  # ARMv7
+```
+
+musl 向けは `.cargo/config.toml` で Rust 付属の `rust-lld` を使用するため、Windows からもクロスビルドできる。
+
+### macOS
+
+ビルドできるのは `dt295` コマンドのみ。macOS 上で Xcode Command Line Tools が必要。
+
+```
+cargo build --release -p dt295-cli --target x86_64-apple-darwin   # x64
+cargo build --release -p dt295-cli --target aarch64-apple-darwin  # ARM64
 ```
 
 ## Windows: TVTest から使う
@@ -52,7 +95,7 @@ cargo build --release -p dt295-cli --target x86_64-unknown-linux-musl   # 静的
 
    純正のアプリ (StationTV X) に戻すときは `dt295 driver restore`。
 
-2. TVTest の BonDriver のフォルダーに、`BonDriver_DT295.dll`、`BonDriver_DT295.ini` (見本は `src/dt295-bondriver/BonDriver_DT295.ini`)、ファームウェア 2 つを置く。
+2. TVTest の BonDriver のフォルダーに、`BonDriver_DT295.dll`, `BonDriver_DT295.ini` (見本はリリースの zip と `src/dt295-bondriver/BonDriver_DT295.ini`), ファームウェア 2 つを置く。
    ini は DLL と同じ名前にし、`[Tuner] DeviceSerial` に使う個体のシリアル番号を書く。
 
 3. TVTest でドライバーに `BonDriver_DT295.dll` を選び、チャンネルスキャンする。
@@ -72,26 +115,38 @@ cargo build --release -p dt295-cli --target x86_64-unknown-linux-musl   # 静的
 
 更新するときは、TVTest を閉じて DLL を置き換える (ini と状態ファイルはそのまま使える)。
 
-詳しくは [docs/usage.md](docs/usage.md) の "BonDriver (TVTest)"、"`dt295 driver`"、"`dt295 logo`"、"困ったとき" セクション。
+詳しくは [docs/usage.md](docs/usage.md) の "BonDriver (TVTest)", "`dt295 driver`", "`dt295 logo`", "困ったとき" セクション。
+
+## Windows: raw-TS モード (任意)
+
+System1 モードがデバイスの中でデスクランブルするのに対し、raw-TS モードはスクランブルされたままの TS を TVTest に渡し、解除は TVTest の CAS プラグインに任せる。
+ini の `[Tuner] RawTS=1` で切り替わる。内部の仕組みと機能差は [docs/raw-ts.md](docs/raw-ts.md)。
+
+- ファームウェアは要らない。レジデント (チップに常駐させる第三者のコード) も補助コア (demod を動かす副 CPU) も純正ファームも使わず、ホストがチップを cold (電源投入直後) から自力で立ち上げる (完全に自前コードのみ)
+- B-CAS の解除は TVTest 側 (CAS プラグインと PC/SC リーダーの契約済みカード) が行う。System1 と違い、デバイスのスロットのカードは使わない
+- 最初の選局は cold の個体が必要。閉じて開き直すだけなら差し直しは要らない
 
 ## Linux: mirakc から使う
 
 `dt295 serve` (デーモン) が個体を開いたまま保持し、mirakc はチューナーのコマンドとして `dt295 tune` を呼ぶ。
 EPGStation は mirakc を Mirakurun として使う。
-動作を確認した構成は、PVE の非特権 LXC 上の Arch Linux (mirakc 3.4.90、mirakc-arib 0.24.40)。
-コマンドはリポジトリのルートで実行する。
+動作を確認した構成は Arch Linux (mirakc 3.4.90, mirakc-arib 0.24.40)。
+コマンドはリポジトリのルート (リリースの tar.gz なら展開したフォルダー) で実行する。
 `dt295` のみを別のマシンにコピーするときは、`packaging/` も一緒にコピーする。
 
-Arch Linux では、リポジトリを clone して `packaging/arch/` で `makepkg -si` とすると、パッケージ `pix-dt295-git` をビルドしてインストールできる。
-コミット済みの HEAD からビルドし、`/usr/bin/dt295`、dt295 ユーザーと `/var/lib/dt295`、udev のルール、`dt295.service` がインストールされるので、下の手順 1 と 3 は不要。
-手順 4 は LXC のときのみ必要で、手順 5 は `/etc/dt295.conf` を書いて `systemctl enable --now dt295` するだけでよい。
-更新は `git pull` の後に同じく `makepkg -si` して `systemctl restart dt295`。
-makepkg は PKGBUILD の `pkgver` をビルドしたバージョンに書き換える (この変更はコミットしなくてよい)。
+パッケージでインストールすると、`/usr/bin/dt295`、dt295 ユーザーと `/var/lib/dt295`、udev のルール、`dt295.service` がインストールされるので、下の手順 1, 3, 4 は不要。
+手順 5 は `/etc/dt295.conf` を書いて `systemctl enable --now dt295` するだけでよい。
 
-1. `dt295` をインストールする (上の "ビルド" セクション):
+- リリースのパッケージ: `apt install ./pix-dt295_0.2.0-1_amd64.deb` (Debian / Ubuntu), `dnf install ./pix-dt295-0.2.0-1.x86_64.rpm` (Fedora / RHEL 系), `pacman -U ./pix-dt295-0.2.0-1-x86_64.pkg.tar.zst` (Arch Linux) のようにインストールする。
+  更新は新しい版を同じくインストールしてから `systemctl restart dt295` (インストールではデーモンは再起動しない)。
+- Arch Linux でリリース前の HEAD を使うとき: リポジトリを clone して `packaging/arch/` で `makepkg -si` とすると、コミット済みの HEAD からパッケージ `pix-dt295-git` をビルドしてインストールできる (リリースの `pix-dt295` とは入れ替わる)。
+  更新は `git pull` の後に同じく `makepkg -si` して `systemctl restart dt295`。
+  makepkg は PKGBUILD の `pkgver` をビルドしたバージョンに書き換える (この変更はコミットしなくてよい)。
+
+1. `dt295` をインストールする (上の "入手"、"ビルド" セクション):
 
    ```
-   install -m 755 target/release/dt295 /usr/local/bin/dt295
+   install -m 755 target/release/dt295 /usr/local/bin/dt295   # リリースの tar.gz なら ./dt295
    ```
 
 2. ファームウェア 2 つを `/usr/lib/firmware/dt295/` に配置 (名前は純正のまま)
@@ -103,26 +158,10 @@ makepkg は PKGBUILD の `pkgver` をビルドしたバージョンに書き換�
    install -d -o dt295 -g dt295 /var/lib/dt295
    ```
 
-4. dt295 グループとログイン中のユーザーが個体にアクセスできるようにする。
-   通常のマシンや VM では、udev のルールを配置する:
+4. dt295 グループとログイン中のユーザーが個体にアクセスできるように、udev のルールを配置する:
 
    ```
-   install -m 644 packaging/arch/60-dt295.rules /etc/udev/rules.d/
-   ```
-
-   PVE の非特権 LXC のホストには dt295 グループが無いので、ホストの `/etc/udev/rules.d/60-dt295.rules` に次の行を書く:
-
-   ```
-   SUBSYSTEM=="usb", ATTR{idVendor}=="06b8", ATTR{idProduct}=="103b", MODE="0666"
-   ```
-
-   `/etc/pve/lxc/<ID>.conf` には次の 2 行を追加する。
-   `/dev/bus/usb` 全体をコンテナーから見えるようにするので、抜き挿しでデバイス番号が変わってもアクセスできる (PVE の USB パススルーはデバイス番号で指定するため、抜き挿しで外れる)。
-   0666 にするのは DT295 のみなので、コンテナーからほかの USB 機器は開けない。
-
-   ```
-   lxc.cgroup2.devices.allow: c 189:* rwm
-   lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir
+   install -m 644 packaging/linux/60-dt295.rules /etc/udev/rules.d/
    ```
 
    `dt295 list` に個体のシリアル番号が表示されれば、アクセスできている。
@@ -133,10 +172,10 @@ makepkg は PKGBUILD の `pkgver` をビルドしたバージョンに書き換�
    [unit AB12345678]
    ```
 
-   systemd のユニットは、`packaging/arch/dt295.service` の `ExecStart` のパスを書き換えて配置する:
+   systemd のユニットは、`packaging/linux/dt295.service` の `ExecStart` のパスを書き換えて配置する:
 
    ```
-   sed 's|^ExecStart=/usr/bin/|ExecStart=/usr/local/bin/|' packaging/arch/dt295.service > /etc/systemd/system/dt295.service
+   sed 's|^ExecStart=/usr/bin/|ExecStart=/usr/local/bin/|' packaging/linux/dt295.service > /etc/systemd/system/dt295.service
    systemctl enable --now dt295
    journalctl -u dt295                          # "opened and booted" が出れば準備完了
    dt295 tune --serial AB12345678 --ter 557142857 --sid 1024 | head -c 10000000 > /tmp/t.ts   # 受信のテスト
@@ -209,4 +248,38 @@ makepkg は PKGBUILD の `pkgver` をビルドしたバージョンに書き換�
 
 更新するときは、録画中でないこと (`curl localhost:40772/api/tuners` の `isFree`) を確認してから、`dt295` を置き換えて `systemctl restart dt295`。
 
-詳しくは [docs/usage.md](docs/usage.md) の "`dt295 serve`"、"`dt295 tune`"、"`dt295 mirakc-channels`"、"`dt295 logo`" セクション。
+詳しくは [docs/usage.md](docs/usage.md) の "`dt295 serve`", "`dt295 tune`", "`dt295 mirakc-channels`", "`dt295 logo`" セクション。
+
+## Linux: raw-TS モード (任意)
+
+System1 がデバイスの中でデスクランブルするのに対し、raw-TS モードは純正ファーム無しでスクランブルされたままの TS を出し、B-CAS の解除をホスト側で行う (完全に自前コードのみ。内部は [docs/raw-ts.md](docs/raw-ts.md))。
+上の "Linux: mirakc から使う" の構成に、次の違いを加える。
+
+- ファームウェア (手順 2) は要らない
+- 解除用に、ホストに PC/SC リーダーと契約済みの B-CAS カード、pcsc-lite (pcscd) と libarib25 (`b25`) が要る
+
+1. `/etc/dt295.conf` の個体に `raw-ts = true` を書く:
+
+   ```ini
+   [unit CD23456789]
+   raw-ts = true
+   ```
+
+2. 解除ツール (pcsc-lite と libarib25) を入れ、pcscd を起動してリーダーと B-CAS カードを認識させる (`pcsc_scan` など)。
+
+3. mirakc は、チューナーを `decoded: false` にし、`filters.decode-filter` に `b25` を設定する (手順 7 の `tuners` を次のようにする):
+
+   ```yaml
+   tuners:
+     - name: dt295-CD23456789
+       types: [GR, BS, CS]
+       command: dt295 tune --serial CD23456789 {{{extra_args}}}
+       decoded: false
+   filters:
+     decode-filter:
+       command: /usr/bin/b25 /dev/stdin /dev/stdout
+   ```
+
+   libarib25 の `b25` は `-` (標準入出力の意味) を受け付けないので、`/dev/stdin /dev/stdout` を渡す。
+
+これで EPGStation からの録画と、ブラウザでの視聴まで、純正ファームを使わずに通る。

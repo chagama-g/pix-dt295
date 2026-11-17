@@ -23,14 +23,16 @@ use super::{
     route_write, service_events,
 };
 use crate::device::{Shared, State};
-use crate::proto::{Io, sleep_ms};
-use crate::signal::{cn_s_mdb, cn_t_mdb};
+use dt295_core::proto::{Io, sleep_ms};
+use dt295_core::signal::{cn_s_mdb, cn_t_mdb};
 use crate::ts::es::EsCheck;
 use crate::ts::psi::StreamView;
 use crate::ts::route::{Op, Router};
 use crate::ts::stats::RawStats;
 use crate::ts::{link, packet, pat};
-use crate::{Result, System, TsSink, fe1};
+use dt295_core::fe1;
+
+use crate::{Result, System, TsSink};
 
 /// EP 0x81 reads kept posted. Between two reads the worker services firmware events
 /// (~10 control transfers) and, every 12 s, the keepalive RPC; with a single synchronous
@@ -144,6 +146,9 @@ pub(crate) fn join(sh: &Shared, w: Worker) -> Joined {
             sleep_ms(10);
         }
         if w.handle.is_finished() {
+            // The worker has exited: no more C/N samples, so clear the live value now (a
+            // stopped stream falls back to the tune-time level, not its last reading).
+            sh.live.reset_cn();
             return match w.handle.join() {
                 Ok(sink) => Joined::Done(sink),
                 Err(_) => {
@@ -954,7 +959,7 @@ impl<'a> Run<'a> {
 
     /// The per-minute statistics line.
     fn minute(&mut self) {
-        if self.win.t0.elapsed() >= Duration::from_secs(60) {
+        if self.win.t0.elapsed() >= Duration::from_mins(1) {
             if let Some(line) = self.win.line(self.dm_sat) {
                 info!("{line}");
             }

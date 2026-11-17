@@ -9,11 +9,12 @@ publish.workspace = true
 
 [dependencies]
 dt295-usb.workspace = true
+dt295-core.workspace = true
+dt295-rawfw.workspace = true
 aes.workspace = true
 cbc.workspace = true
 crc.workspace = true
 getrandom.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 
 [lints]

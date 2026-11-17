@@ -120,9 +120,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.11.0"
+version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "375989decec1a0fa424442bed520fa12ede43a48475ce8c7417d2c69b32b5f6b"
+checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -303,20 +303,21 @@ dependencies = [
 
 [[package]]
 name = "dt295"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "cbc",
  "crc",
+ "dt295-core",
+ "dt295-rawfw",
  "dt295-usb",
  "getrandom 0.4.3",
- "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "dt295-bondriver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "dt295",
@@ -329,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "dt295-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -345,8 +346,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "dt295-core"
+version = "0.2.0"
+dependencies = [
+ "dt295-usb",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "dt295-frmon"
+version = "0.2.0"
+
+[[package]]
+name = "dt295-rawfw"
+version = "0.2.0"
+dependencies = [
+ "dt295-core",
+ "dt295-frmon",
+ "dt295-usb",
+ "libc",
+ "tracing",
+ "windows-sys",
+]
+
+[[package]]
 name = "dt295-usb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nusb",
  "thiserror",

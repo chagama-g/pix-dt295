@@ -186,7 +186,7 @@ impl CardWatch {
 /// Start-overs in a row for a firmware that stopped acking, each within [`IN_A_ROW`]
 /// of the one before; the next one waits until then.
 const STALL_TRIES: u32 = 3;
-const IN_A_ROW: Duration = Duration::from_secs(60);
+const IN_A_ROW: Duration = Duration::from_mins(1);
 
 /// Says when a host should start a stream over because the firmware stopped acking
 /// ([`Device::needs_recovery`]). It does within seconds of a stream's start more often
@@ -212,7 +212,7 @@ impl StallWatch {
 
     /// The firmware stopped acking (call while it has not been started again): `true`
     /// = stop the stream, [`Device::start`] the device again, tune the channel again
-    /// and start the stream. `false`: it did so [`STALL_TRIES`] times in a row; the
+    /// and start the stream. `false`: it did so `STALL_TRIES` times in a row; the
     /// next one waits a minute.
     ///
     /// [`Device::start`]: crate::Device::start

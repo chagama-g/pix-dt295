@@ -181,9 +181,7 @@ impl Drop for LogFile {
 
 /// `<log>.1`.
 fn previous_log(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".1");
-    PathBuf::from(s)
+    path.with_added_extension("1")
 }
 
 /// Start writing the log to `path` for this driver instance.

@@ -1,0 +1,24 @@
+[package]
+name = "dt295-rawfw"
+description = "PIX-DT295 blob-free raw-TS path: container build, cold stream worker, demod I2C and FR monitor host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dt295-core.workspace = true
+dt295-frmon.workspace = true
+dt295-usb.workspace = true
+tracing.workspace = true
+
+# Raising the stream thread's scheduling priority (prio.rs).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

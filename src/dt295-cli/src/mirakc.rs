@@ -29,7 +29,7 @@ use clap::Args;
 use dt295::chan::{self, NO_TSID, SatLine};
 
 use crate::bonini::{decode_ini, ini_lines, ini_section};
-use crate::ch2;
+use dt295::ch2;
 
 mod psi;
 mod scan;
@@ -389,6 +389,8 @@ fn render_logos(channels: &[Channel], dir: &str, have: impl Fn(u64) -> bool) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     const INI: &str = "[Tuner]\nCATV=0\n[BS]\nBS15/101=1318000,0x40F1,101\nbad=12,1\n\
@@ -424,7 +426,7 @@ mod tests {
             2,
             "the line that does not parse is not a channel"
         );
-        assert!(matches!(&s[2], Space::Satellite { bs: false, .. }));
+        assert_matches!(&s[2], Space::Satellite { bs: false, .. });
     }
 
     #[test]

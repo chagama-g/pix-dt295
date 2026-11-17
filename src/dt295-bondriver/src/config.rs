@@ -30,31 +30,31 @@ impl ModulePaths {
     /// Split a module file name: the last `\` or `/` ends the folder, the last `.`
     /// starts the extension.
     pub fn from_module_path(path: &OsStr) -> Self {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::{OsStrExt, OsStringExt};
-            let w: Vec<u16> = path.encode_wide().collect();
-            let dir_end = w
-                .iter()
-                .rposition(|&c| c == u16::from(b'\\') || c == u16::from(b'/'))
-                .map_or(0, |i| i + 1);
-            let stem_end = w
-                .iter()
-                .rposition(|&c| c == u16::from(b'.'))
-                .unwrap_or(w.len());
-            Self {
-                dir: OsString::from_wide(&w[..dir_end]),
-                stem: OsString::from_wide(&w[..stem_end]),
+        cfg_select! {
+            windows => {
+                use std::os::windows::ffi::{OsStrExt, OsStringExt};
+                let w: Vec<u16> = path.encode_wide().collect();
+                let dir_end = w
+                    .iter()
+                    .rposition(|&c| c == u16::from(b'\\') || c == u16::from(b'/'))
+                    .map_or_default(|i| i + 1);
+                let stem_end = w
+                    .iter()
+                    .rposition(|&c| c == u16::from(b'.'))
+                    .unwrap_or(w.len());
+                Self {
+                    dir: OsString::from_wide(&w[..dir_end]),
+                    stem: OsString::from_wide(&w[..stem_end]),
+                }
             }
-        }
-        #[cfg(not(windows))]
-        {
-            let s = path.to_string_lossy();
-            let dir_end = s.rfind(['\\', '/']).map_or(0, |i| i + 1);
-            let stem_end = s.rfind('.').unwrap_or(s.len());
-            Self {
-                dir: OsString::from(&s[..dir_end]),
-                stem: OsString::from(&s[..stem_end]),
+            _ => {
+                let s = path.to_string_lossy();
+                let dir_end = s.rfind(['\\', '/']).map_or_default(|i| i + 1);
+                let stem_end = s.rfind('.').unwrap_or(s.len());
+                Self {
+                    dir: OsString::from(&s[..dir_end]),
+                    stem: OsString::from(&s[..stem_end]),
+                }
             }
         }
     }
@@ -108,8 +108,18 @@ pub struct Config {
     /// `Some` from an ini (it cannot be turned off); `None` only for a driver that must
     /// not touch the disk (tests).
     pub state_file: Option<PathBuf>,
+    /// `<dll>.ch2`, TVTest's channel-scan file (next to the DLL, independent of `StateFile`):
+    /// read in raw-TS mode to prime on a known on-air channel at the very first open. Always
+    /// `Some` from an ini; `None` only for a driver that must not touch the disk (tests).
+    pub ch2_file: Option<PathBuf>,
     /// UHF, CATV (unless hidden), then BS and CS110 when they have lines.
     pub spaces: Vec<Space>,
+    /// `[Tuner] RawTS`: non-zero = the blob-free raw-TS path -- the host brings the chip up,
+    /// tunes over the host-face I2C, arms the capture engine and runs its own TS pump (no
+    /// resident, no aux core, no vendor firmware), streaming the scrambled TS for the PC-side
+    /// B-CAS (TVTest's CAS plugin) to descramble. Absent / 0 = the System1 viewing path
+    /// (vendor firmware `Firmware` / `TrcFirmware`, the device's internal B-CAS reader).
+    pub raw_ts: bool,
 }
 
 impl Config {
@@ -147,6 +157,9 @@ impl Config {
             "" => paths.sibling(".state"),
             p => paths.resolve(p),
         });
+        // TVTest writes <dll>.ch2 next to the DLL, not next to a relocated StateFile, so derive
+        // it from the module path (the same sibling the log and the default state use).
+        let ch2_file = Some(paths.sibling(".ch2"));
 
         let mut spaces = Vec::new();
         if tuner_int(ini, "UHF", 1) != 0 {
@@ -158,6 +171,9 @@ impl Config {
         spaces.extend(satellite_space(ini, "BS"));
         spaces.extend(satellite_space(ini, "CS110"));
 
+        // RawTS=1 selects the blob-free raw-TS path (host-side, PC B-CAS); else System1.
+        let raw_ts = tuner_int(ini, "RawTS", 0) != 0;
+
         Self {
             firmware,
             trc_firmware,
@@ -165,7 +181,9 @@ impl Config {
             log_file,
             log_level,
             state_file,
+            ch2_file,
             spaces,
+            raw_ts,
         }
     }
 }
@@ -256,13 +274,7 @@ pub fn decode_ini(bytes: &[u8]) -> String {
         return String::from_utf8_lossy(rest).into_owned();
     }
     if let Some(rest) = bytes.strip_prefix(b"\xFF\xFE") {
-        let units: Vec<u16> = rest
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
-            .collect();
-        return String::from_utf16_lossy(&units);
+        return String::from_utf16le_lossy(rest);
     }
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_owned(),
@@ -288,7 +300,7 @@ fn restore_key(k: &str) -> String {
 /// protected (see `KEY_STANDINS`), and no backslash line continuation. A
 /// leading UTF-8 BOM is stripped.
 pub fn parse_ini(text: &str) -> Result<Ini, ini::ParseError> {
-    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let text = text.trim_prefix('\u{FEFF}');
     let mut norm = String::with_capacity(text.len());
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with([';', '#']) {
@@ -559,6 +571,14 @@ Firmware=
             .firmware,
             PathBuf::from(r"C:\TVTest\BonDriver\")
         );
+    }
+
+    #[test]
+    fn raw_ts_mode() {
+        // Absent / 0 = the System1 path; RawTS=1 = the blob-free raw-TS path.
+        assert!(!config("").raw_ts);
+        assert!(!config("[Tuner]\nRawTS=0\n").raw_ts);
+        assert!(config("[Tuner]\nRawTS=1\n").raw_ts);
     }
 
     #[test]

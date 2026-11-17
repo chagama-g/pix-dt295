@@ -5,7 +5,7 @@
 //! * [`es`]     whether the video / audio come out descrambled (PES headers).
 //! * [`packet`] 188-byte packet header helpers and packet-grid sync.
 //! * [`pat`]    PAT checks on single packets, section search and PAT parsing.
-//! * [`pmt`]    PMT parsing (the ES of a program and their ECMs).
+//! * `pmt`      PMT parsing (the ES of a program and their ECMs).
 //! * [`section`] section reassembly per PID, descriptor loops.
 //! * [`link`]   the device's link-layer AES decryption and the link-key check.
 //! * [`stats`]  per-stream header statistics (continuity errors, TEI, PIDs, ...).

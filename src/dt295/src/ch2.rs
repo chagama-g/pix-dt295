@@ -63,15 +63,11 @@ pub fn parse(text: &str) -> Vec<Service> {
 
 /// Read a `.ch2` file: UTF-16 (LE or BE) with a BOM, else UTF-8 (BOM optional).
 pub fn read(path: &Path) -> io::Result<Vec<Service>> {
-    fn utf16(b: &[u8], unit: fn([u8; 2]) -> u16) -> String {
-        let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| unit(c)).collect();
-        String::from_utf16_lossy(&units)
-    }
     let data = fs::read(path)?;
     let text = match data.as_slice() {
-        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
-        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
-        d => String::from_utf8_lossy(d.strip_prefix(UTF8_BOM).unwrap_or(d)).into_owned(),
+        [0xFF, 0xFE, rest @ ..] => String::from_utf16le_lossy(rest),
+        [0xFE, 0xFF, rest @ ..] => String::from_utf16be_lossy(rest),
+        d => String::from_utf8_lossy(d.trim_prefix(UTF8_BOM)).into_owned(),
     };
     Ok(parse(&text))
 }

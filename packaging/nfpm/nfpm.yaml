@@ -1,0 +1,96 @@
+# The deb, rpm and Arch Linux packages: the dt295 command and the same service files as
+# the PKGBUILD's package. The release workflow (.github/workflows/release.yml) builds
+# them from the static musl binary, so they have no dependencies. By hand, from the
+# repository root with nfpm (https://nfpm.goreleaser.com):
+#
+#   install -Dm755 target/x86_64-unknown-linux-musl/release/dt295 target/nfpm/dt295
+#   NFPM_ARCH=amd64 VERSION=0.2.0 nfpm package -f packaging/nfpm/nfpm.yaml -p deb -t target/
+#
+# -p is deb, rpm or archlinux. NFPM_ARCH is in Go's names (amd64, 386, arm64, arm7);
+# nfpm turns it into the names of deb (amd64, i386, arm64, armhf), rpm (x86_64, i386,
+# aarch64, armv7hl) and Arch (x86_64, i686, aarch64, armv7h). The vendor firmware is not
+# packaged; see INSTALL.md.
+
+name: pix-dt295
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: utils
+priority: optional
+maintainer: smpn2 <vyfix@yahoo.co.jp>
+description: User-mode driver and tuner daemon for the Pixela PIX-DT295 (dt295 serve / tune for mirakc)
+homepage: https://github.com/smpn2/pix-dt295
+license: MIT
+archlinux:
+  packager: smpn2 <vyfix@yahoo.co.jp>
+
+# Every mode is given: nfpm would take the source file's, which depends on the checkout
+# (all 0777 on a Windows drive seen from WSL).
+contents:
+  - src: target/nfpm/dt295
+    dst: /usr/bin/dt295
+    file_info:
+      mode: 0755
+  - src: packaging/linux/dt295.service
+    dst: /usr/lib/systemd/system/dt295.service
+    file_info:
+      mode: 0644
+  - src: packaging/linux/dt295.sysusers
+    dst: /usr/lib/sysusers.d/dt295.conf
+    file_info:
+      mode: 0644
+  - src: packaging/linux/dt295.tmpfiles
+    dst: /usr/lib/tmpfiles.d/dt295.conf
+    file_info:
+      mode: 0644
+  - src: packaging/linux/60-dt295.rules
+    dst: /usr/lib/udev/rules.d/60-dt295.rules
+    file_info:
+      mode: 0644
+  # The firmware goes here (the default firmware-dir of dt295 serve).
+  - dst: /usr/lib/firmware/dt295
+    type: dir
+    file_info:
+      mode: 0755
+  - src: README.md
+    dst: /usr/share/doc/pix-dt295/README.md
+    file_info:
+      mode: 0644
+  - src: INSTALL.md
+    dst: /usr/share/doc/pix-dt295/INSTALL.md
+    file_info:
+      mode: 0644
+  - src: docs/usage.md
+    dst: /usr/share/doc/pix-dt295/usage.md
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/pix-dt295/copyright
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/licenses/pix-dt295/LICENSE
+    type: license
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/licenses/pix-dt295/LICENSE
+    packager: archlinux
+    file_info:
+      mode: 0644
+
+overrides:
+  deb:
+    scripts: &scripts
+      postinstall: packaging/nfpm/postinstall.sh
+      preremove: packaging/nfpm/preremove.sh
+  rpm:
+    scripts: *scripts
+  # pacman's hooks do the rest of postinstall.sh (sysusers, tmpfiles, udev, systemd), as
+  # for the PKGBUILD's package. nfpm puts the script into the function post_install.
+  archlinux:
+    scripts:
+      postinstall: packaging/nfpm/archlinux-postinstall.sh

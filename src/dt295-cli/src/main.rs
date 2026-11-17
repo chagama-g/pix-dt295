@@ -23,13 +23,13 @@
 
 mod bonini;
 mod capture;
-mod ch2;
 mod driver;
 mod etw;
 mod lineup;
 mod list;
 mod logo;
 mod mirakc;
+mod reg;
 mod sections;
 // the configuration and the protocol build everywhere (their tests run on Windows too)
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -78,6 +78,8 @@ enum Command {
         #[command(subcommand)]
         command: driver::DriverCommand,
     },
+    /// Read or write chip registers through the 0xBC window (raw-TS bring-up helper).
+    Reg(reg::RegArgs),
     /// Turn a USB ETW trace of the vendor driver (tracerpt XML) into an access log.
     EtwUrbs(etw::EtwArgs),
     /// The channels of a mirakc configuration: from a TVTest channel scan (.ch2 and its ini),
@@ -210,6 +212,7 @@ fn main() -> ExitCode {
         Command::Lineup(args) => return lineup::run(&args),
         Command::Logo(args) => logo::run(&args),
         Command::Driver { command } => driver::run(&command),
+        Command::Reg(args) => reg::run(&args),
         Command::EtwUrbs(args) => etw::run(&args),
         Command::MirakcChannels(args) => mirakc::run(&args),
         #[cfg(unix)]
@@ -228,6 +231,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use clap::CommandFactory;
 
@@ -303,7 +308,7 @@ mod tests {
 
     #[test]
     fn list_and_serial_args() {
-        assert!(matches!(parse(&["list"]).unwrap().command, Command::List));
+        assert_matches!(parse(&["list"]).unwrap().command, Command::List);
         let cli = parse(&[
             "capture",
             "--fw",
@@ -323,11 +328,11 @@ mod tests {
     #[test]
     fn state_show_args() {
         let cli = parse(&["state", "show", "BonDriver_DT295.state"]).unwrap();
-        assert!(matches!(
+        assert_matches!(
             cli.command,
             Command::State { command: StateCommand::Show { file } }
                 if file == std::path::Path::new("BonDriver_DT295.state")
-        ));
+        );
     }
 
     #[test]

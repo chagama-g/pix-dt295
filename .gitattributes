@@ -9,9 +9,12 @@
 *.bat text eol=crlf
 *.ini text eol=crlf
 
-# Run by a Unix shell (WSL / Linux).
+# Run by a Unix shell (WSL / Linux), or copied as they are to a Linux machine: a CRLF
+# script does not run.
 *.sh text eol=lf
-/packaging/arch/** text eol=lf
+/packaging/** text eol=lf
+# Rewritten by `gh actions-lock` (WSL / Linux): the lockfile and the workflows.
+/.github/** text eol=lf
 
 # Hunk headers name the enclosing function in diffs.
 *.rs diff=rust
@@ -34,6 +37,3 @@
 *.png binary
 *.jpg binary
 *.zip binary
-
-# Copied as they are to a Linux machine: a CRLF script does not run.
-packaging/examples/** text eol=lf

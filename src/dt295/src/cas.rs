@@ -16,7 +16,7 @@
 use tracing::{info, warn};
 
 use crate::auth::{Block, cbc0_decrypt, cbc0_encrypt, cmac, nonce, t8_raw};
-use crate::proto::{Io, sleep_ms};
+use dt295_core::proto::{Io, sleep_ms};
 use crate::{Error, Result};
 
 /// KA_KEY = K_RT (xmmword_1400784F8 ^ xmmword_140078538).
@@ -183,11 +183,7 @@ pub(crate) fn bcas_stage2_only(io: &mut Io) -> Result<()> {
         "b-cas stage2={r:04x}{}",
         if r & 0xFF != 0 { "  (rejected)" } else { "" }
     );
-    if r & 0xFF == 0 {
-        Ok(())
-    } else {
-        Err(Error::Protocol("b-cas stage 2 not accepted".into()))
-    }
+    (r & 0xFF == 0).ok_or_else(|| Error::Protocol("b-cas stage 2 not accepted".into()))
 }
 
 #[cfg(test)]

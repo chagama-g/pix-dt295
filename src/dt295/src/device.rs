@@ -11,14 +11,17 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
-use crate::proto::{FW_STALL_LIMIT, Io, Proto, REG_FW_STATE};
+use dt295_core::fe1;
+use dt295_core::proto::{FW_STALL_LIMIT, Io, Proto, REG_FW_STATE};
+
 use crate::s1::{KA_FIRST, KA_INTERVAL, Link, S1};
 use crate::ts::psi::PsiKeeper;
-use crate::{Error, PsiRecord, Result, Status, System, TsSink, fe1, fw};
+use crate::{Error, PsiRecord, Result, Status, System, TsSink, fw};
 
 /// What the host and the stream worker share.
 #[derive(Debug)]
@@ -172,6 +175,12 @@ impl LiveInner {
         self.cn_at.store(0, Ordering::Release);
         self.es.store(ES_UNKNOWN, Ordering::Release);
     }
+    /// Drop any live C/N sample: a stream stopped, so the next `GetSignalLevel` falls back to
+    /// the tune-time level rather than report the ended stream's last reading for the 3 s
+    /// freshness window that `cn` otherwise keeps live.
+    pub(crate) fn reset_cn(&self) {
+        self.cn_at.store(0, Ordering::Release);
+    }
     pub(crate) fn note_card_event(&self, state: u8) {
         self.set_card_state(state);
         self.card_events.fetch_add(1, Ordering::AcqRel);
@@ -208,9 +217,10 @@ impl LiveInner {
         self.cn_at.store(self.now_ms(), Ordering::Release);
     }
     fn cn(&self) -> Option<i32> {
-        if !self.streaming() {
-            return None;
-        }
+        // Freshness alone, not `streaming()`: the raw-TS worker samples the C/N over the aux
+        // through `with_io`, which keeps `streaming()` false, so a recent sample is the
+        // signal that a worker is publishing. A sample older than 3 s (the stream stopped)
+        // reads as no live value, and the host falls back to the tune-time level.
         let at = self.cn_at.load(Ordering::Acquire);
         if at == 0 || self.now_ms().saturating_sub(at) > 3000 {
             return None;
@@ -229,6 +239,26 @@ pub struct Device {
     /// The firmware reached idle / ready.
     fw_booted: bool,
     s1: S1,
+    /// The blob-free raw-TS stream worker, while one runs (its thread holds the device
+    /// I/O for the whole stream, like the System1 worker; the host only stops it).
+    raw: Option<RawWorker>,
+}
+
+/// A running blob-free raw-TS stream worker: it owns the device I/O (its thread holds
+/// the proto lock through one `with_io` for the whole capture), forwarding TS to the
+/// sink until `stop` is cleared. Its thread returns the sink and the capture result.
+struct RawWorker {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<(TsSink, Result<crate::RawCaptureStats>)>,
+}
+
+impl fmt::Debug for RawWorker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawWorker")
+            .field("stop", &self.stop.load(Ordering::Relaxed))
+            .field("finished", &self.handle.is_finished())
+            .finish()
+    }
 }
 
 impl fmt::Debug for Device {
@@ -316,6 +346,247 @@ impl Device {
         ))
     }
 
+    /// Start a blob-free COLD raw-TS stream worker: host board bring-up, host-face tune,
+    /// capture arm and ring->EP pump, with no resident, no aux core and no vendor firmware
+    /// (see [`dt295_rawfw::rawstream::run_cold_stream`]). The worker pumps scrambled TS into
+    /// the sink until stopped; the host descrambles it with a real card. A channel change is
+    /// a stop + a fresh start on the new frequency.
+    pub fn stream_start_cold(
+        &mut self,
+        terrestrial: bool,
+        freq_hz: u32,
+        tsid: Option<u16>,
+        full: bool,
+        duration: Duration,
+        sink: TsSink,
+    ) -> Result<()> {
+        if self.raw.is_some() {
+            return Err(Error::State("a raw-TS stream is already running".into()));
+        }
+        let stop = Arc::new(AtomicBool::new(true));
+        let sh = Arc::clone(&self.sh);
+        let worker_stop = Arc::clone(&stop);
+        // The caller's span (the daemon's unit, say) goes with the worker, so its log lines
+        // say which unit they are about.
+        let span = tracing::Span::current();
+        let handle = thread::Builder::new()
+            .name("dt295-cold-worker".into())
+            .spawn(move || {
+                let _span = span.enter();
+                let mut sink = sink;
+                let result = sh.with_io(|io| {
+                    let cn_report = |mdb: i32| sh.live.publish_cn(mdb);
+                    dt295_rawfw::rawstream::run_cold_stream(
+                        io,
+                        terrestrial,
+                        freq_hz,
+                        tsid,
+                        full,
+                        duration,
+                        Some(&worker_stop),
+                        &mut sink,
+                        Some(&cn_report),
+                    )
+                });
+                (sink, result)
+            })
+            .map_err(Error::from)?;
+        self.raw = Some(RawWorker { stop, handle });
+        Ok(())
+    }
+
+    /// Whether a raw-TS worker is running (its thread has not exited). False once the
+    /// worker ended on its own -- a capture fault or an unplug -- so the host can reap it
+    /// with [`Device::stream_stop_raw`] and learn why.
+    pub fn raw_running(&self) -> bool {
+        self.raw.as_ref().is_some_and(|w| !w.handle.is_finished())
+    }
+
+    /// Whether a raw-TS worker slot is occupied (running, or ended but not yet reaped).
+    pub fn raw_present(&self) -> bool {
+        self.raw.is_some()
+    }
+
+    /// Stop the raw-TS worker and return what it captured (or its fault). The stream loop
+    /// polls the stop flag every pass (~1 ms) and exits on its own; a worker still in the
+    /// uninterruptible cold bootstrap finishes it first, then exits, which this waits out
+    /// (it does not abort the EP mid-bootstrap, which would fault the tune). A genuinely
+    /// wedged worker gets one EP nudge as a last resort; one that still will not exit keeps
+    /// its own device reference (nothing is freed under it) and a re-plug is the reset.
+    /// No-op if none is running.
+    pub fn stream_stop_raw(&mut self) -> Result<crate::RawCaptureStats> {
+        let Some(w) = self.raw.take() else {
+            return Ok(crate::RawCaptureStats::default());
+        };
+        w.stop.store(false, Ordering::Relaxed);
+        // The stream loop polls the stop flag every pass (~1 ms, the EP read timeout) and
+        // exits on its own, so no EP abort is needed to unstick it. A worker still in the
+        // (uninterruptible) cold bootstrap -- the resident load + tune, ~13 s -- finishes
+        // that first and then sees the flag; we wait it out rather than abort its EP
+        // mid-bootstrap, which would fault the tune. A genuinely wedged worker gets one EP
+        // nudge as a last resort; one that still will not exit keeps its own device
+        // reference (nothing is freed under it) and a re-plug is the reset.
+        let t0 = Instant::now();
+        let mut nudged = false;
+        loop {
+            if w.handle.is_finished() {
+                // The worker has exited: no more C/N samples, so clear the live value now (a
+                // stopped stream must not report its last reading for the freshness window).
+                self.sh.live.reset_cn();
+                return match w.handle.join() {
+                    Ok((_, r)) => r,
+                    Err(_) => {
+                        error!("raw-TS worker panicked");
+                        Err(Error::State("the raw-TS stream worker panicked".into()))
+                    }
+                };
+            }
+            if !nudged && t0.elapsed() >= Duration::from_secs(25) {
+                nudged = true;
+                let _ = self.sh.usb.abort_pipe(crate::s1::EP_TS);
+            }
+            if t0.elapsed() >= Duration::from_secs(35) {
+                error!(
+                    "raw-TS worker did not exit within 35 s; leaving it running -- re-plug the device"
+                );
+                self.raw = Some(w);
+                return Err(Error::State("the raw-TS stream worker did not exit".into()));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Read one register of an I2C slave (e.g. the demod at 7-bit 0x10) over the host face
+    /// of the Fujitsu I2C controller (0x00FD8FE0, the 0xBC window). Blob-free: no aux core,
+    /// no monitor, no vendor firmware. See [`dt295_rawfw::fjcore`].
+    pub fn fj_demod_read(&self, slave: u8, reg: u8) -> Result<u8> {
+        self.sh
+            .with_io(|io| dt295_rawfw::fjcore::demod_read(io, slave, reg))
+    }
+
+    /// Experimental blob-free COLD read: run the host-side board bring-up (external
+    /// memory, the INITIALIZE clock/strap chain, the 0xF10114 I2C-block enable), set up
+    /// the host-face I2C, and read one demod register with step diagnostics. Verifies on
+    /// our own hardware whether the demod I2C can be powered from cold with no resident
+    /// and no aux core. `restore` puts the board registers back so a re-plug is not
+    /// needed between runs. Returns the value and the report. See [`dt295_rawfw::fjcore`].
+    pub fn fj_demod_read_cold(
+        &self,
+        slave: u8,
+        reg: u8,
+        restore: bool,
+    ) -> (Result<u8>, Vec<String>) {
+        match self.sh.with_io(|io| {
+            let (res, log) = dt295_rawfw::fjcore::demod_read_cold(io, slave, reg, restore);
+            Ok((res, log))
+        }) {
+            Ok(pair) => pair,
+            Err(e) => (Err(e), Vec::new()),
+        }
+    }
+
+    /// Whether our blob-free monitor BODY is already present on the chip: the cold bring-up
+    /// has run and persists (across worker restarts and a reopen without a re-plug), so a
+    /// later tune only needs a retune + rearm, not the once-per-plug bootstrap (a second
+    /// bootstrap faults). A pure host-window read, safe on a cold device (it then reads the
+    /// stock boot0 body and returns false). No stream worker may run when this is called.
+    pub fn cold_monitor_installed(&self) -> bool {
+        // A read error defaults to "installed" (skip the bring-up), not "cold": re-running the
+        // once-per-plug full bring-up on a chip that is actually up faults it (needs a re-plug),
+        // whereas skipping it when the chip really is cold just fails this tune cleanly and the
+        // host retries. So the safe default on an unreadable probe is to not bring up again.
+        self.sh
+            .with_io(|io| dt295_rawfw::frmon_host::monitor_installed(io).unwrap_or(true))
+    }
+
+    /// Experimental blob-free COLD tune: host board bring-up + host-face I2C, then run
+    /// the front-end init and tune ([`dt295_core::fe1`]) over the host face and read the
+    /// lock / C/N. No resident, no aux core, no vendor firmware. Returns whether it
+    /// locked and the step report. See [`dt295_rawfw::fjcore::cold_tune`].
+    pub fn fj_cold_tune(
+        &self,
+        terrestrial: bool,
+        freq_hz: u32,
+        tsid: Option<u16>,
+        restore: bool,
+    ) -> (Result<bool>, Vec<String>) {
+        match self.sh.with_io(|io| {
+            Ok(dt295_rawfw::fjcore::cold_tune(
+                io,
+                terrestrial,
+                freq_hz,
+                tsid,
+                restore,
+            ))
+        }) {
+            Ok(pair) => pair,
+            Err(e) => (Err(e), Vec::new()),
+        }
+    }
+
+    /// Experimental blob-free COLD capture arm (wall C): host board bring-up + host-face
+    /// tune, install our monitor, arm the capture engine, and report whether the TS ring
+    /// fills -- all with no resident, no aux core, no vendor firmware. Returns whether it
+    /// locked and the ring advanced, plus the step report. See
+    /// [`dt295_rawfw::fjcore::cold_capture`].
+    pub fn fj_cold_capture(
+        &self,
+        terrestrial: bool,
+        freq_hz: u32,
+        tsid: Option<u16>,
+    ) -> (Result<bool>, Vec<String>) {
+        match self
+            .sh
+            .with_io(|io| Ok(dt295_rawfw::fjcore::cold_capture(io, terrestrial, freq_hz, tsid)))
+        {
+            Ok(pair) => pair,
+            Err(e) => (Err(e), Vec::new()),
+        }
+    }
+
+    /// Experimental blob-free COLD stream (end to end): host board bring-up, host-face
+    /// tune, monitor, capture arm, then pump the ring to EP 0x81 for `secs` and count
+    /// bytes + TS sync -- no resident, no aux core, no vendor firmware. Optionally writes
+    /// the captured TS to `out_path`. See [`dt295_rawfw::fjcore::cold_stream`].
+    pub fn fj_cold_stream(
+        &self,
+        terrestrial: bool,
+        freq_hz: u32,
+        tsid: Option<u16>,
+        secs: u64,
+        out_path: Option<&str>,
+    ) -> (Result<(u64, f32)>, Vec<String>) {
+        match self.sh.with_io(|io| {
+            Ok(dt295_rawfw::fjcore::cold_stream(
+                io,
+                terrestrial,
+                freq_hz,
+                tsid,
+                secs,
+                out_path,
+            ))
+        }) {
+            Ok(pair) => pair,
+            Err(e) => (Err(e), Vec::new()),
+        }
+    }
+
+    /// Read `len` bytes from chip address `addr` through the stock 0xBC register
+    /// window (24-bit addresses; no banking). A bring-up / analysis helper.
+    pub fn reg_read(&self, addr: u32, len: usize) -> Result<Vec<u8>> {
+        self.sh.with_io(|io| {
+            let mut buf = vec![0u8; len];
+            io.read_block(addr, &mut buf)?;
+            Ok(buf)
+        })
+    }
+
+    /// Write `data` to chip address `addr` through the stock 0xBC register window.
+    /// A bring-up / analysis helper; RAM and registers reset on a re-plug.
+    pub fn reg_write(&self, addr: u32, data: &[u8]) -> Result<()> {
+        self.sh.with_io(|io| io.write_block(addr, data))
+    }
+
     fn with_usb(usb: dt295_usb::Result<dt295_usb::Device>) -> Result<Self> {
         let usb = usb.map_err(|e| {
             error!("usbx_open: {e}");
@@ -328,6 +599,7 @@ impl Device {
             sh: Arc::new(Shared::new(usb)),
             fw_booted: false,
             s1: S1::new(),
+            raw: None,
         })
     }
 
@@ -564,6 +836,9 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        if self.raw.is_some() {
+            let _ = self.stream_stop_raw();
+        }
         if self.s1.running() {
             let _ = self.s1.stream_stop(&self.sh);
         }
@@ -580,15 +855,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_cn_needs_a_running_stream_and_a_fresh_sample() {
+    fn live_cn_needs_a_fresh_sample() {
         let l = LiveInner::new();
-        assert_eq!(l.cn(), None);
+        assert_eq!(l.cn(), None); // no sample yet
         l.publish_cn(12_345);
-        assert_eq!(l.cn(), None); // not streaming
-        l.set_streaming(true);
-        assert_eq!(l.cn(), Some(12_345));
+        assert_eq!(l.cn(), Some(12_345)); // a fresh sample shows (the raw path never sets streaming)
         l.reset_stream();
-        assert_eq!(l.cn(), None);
+        assert_eq!(l.cn(), None); // a new worker clears it until it samples again
 
         // a sample older than 3 s does not count
         let Some(epoch) = Instant::now().checked_sub(std::time::Duration::from_secs(10)) else {
@@ -598,7 +871,6 @@ mod tests {
             epoch,
             ..LiveInner::new()
         };
-        old.set_streaming(true);
         old.publish_cn(7);
         assert_eq!(old.cn(), Some(7));
         old.cn_at.store(1, Ordering::Release); // taken at the epoch, 10 s ago

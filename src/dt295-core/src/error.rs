@@ -31,7 +31,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
     /// The numeric status code of this error (`DT295_E_*`), for the log lines that
     /// print it (`rc=%d`).
-    pub(crate) fn code(&self) -> i32 {
+    pub fn code(&self) -> i32 {
         match self {
             Error::Usb(_) | Error::Transfer(_) => -1,
             Error::Timeout(_) => -2,
@@ -46,7 +46,7 @@ impl Error {
 
     /// The error as `DT295_E_USB`: a failed sub-step reported as a failure of the
     /// step's transfer.
-    pub(crate) fn into_usb(self) -> Error {
+    pub fn into_usb(self) -> Error {
         match self {
             e @ (Error::Usb(_) | Error::Transfer(_)) => e,
             other => Error::Transfer(other.to_string()),

@@ -7,6 +7,7 @@
 //! linkkey <32 hex>
 //! linkkey-pending <32 hex>
 //! psi <kind> <other> <id> <sub> <seen_day> <section hex>
+//! rawchannel <space> <channel>
 //! ```
 //! One record per line; unknown keywords (also an older version's `service` lines) are
 //! skipped and go at the next save. Saved via `<file>.tmp` and a rename so a crash keeps
@@ -36,6 +37,9 @@ pub struct State {
     /// Keys handed out but never proved, newest first.
     pub pending_keys: Vec<[u8; 16]>,
     pub psi: Vec<PsiRecord>,
+    /// Raw-TS: the last-viewed (space, channel), primed on at the next open so the first
+    /// SetChannel is a fast resume.
+    pub raw_channel: Option<(u32, u32)>,
 }
 
 /// The most `linkkey-pending` keys kept.
@@ -86,6 +90,14 @@ impl State {
                     }
                 }
                 "psi" => st.psi.extend(parse_psi(&mut tok)),
+                "rawchannel" => {
+                    if let (Some(s), Some(c)) = (
+                        tok.next().and_then(|t| t.parse().ok()),
+                        tok.next().and_then(|t| t.parse().ok()),
+                    ) {
+                        st.raw_channel = Some((s, c));
+                    }
+                }
                 _ => {} // '#' comments, "dt295-state", and keywords of a newer driver
             }
         }
@@ -119,6 +131,9 @@ impl State {
             );
             push_hex(&mut out, &r.section);
             out.push('\n');
+        }
+        if let Some((space, channel)) = self.raw_channel {
+            let _ = writeln!(out, "rawchannel {space} {channel}");
         }
         out
     }
@@ -159,9 +174,7 @@ impl State {
 
 /// `<path>.tmp` (the suffix is appended to the full file name).
 fn tmp_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".tmp");
-    PathBuf::from(s)
+    path.with_added_extension("tmp")
 }
 
 fn parse_psi<'a>(tok: &mut impl Iterator<Item = &'a str>) -> Option<PsiRecord> {
@@ -218,6 +231,7 @@ mod tests {
     fn sample_state() -> State {
         State {
             pending_keys: Vec::new(),
+            raw_channel: Some((2, 5)),
             link_key: Some([
                 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
                 0xEE, 0xFF,
@@ -390,6 +404,7 @@ mod tests {
             pending_keys: Vec::new(),
             link_key: None,
             psi: vec![],
+            raw_channel: None,
         };
         smaller.save(&path).unwrap();
         assert_eq!(State::load(&path).unwrap(), Some(smaller));

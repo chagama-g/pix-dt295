@@ -1,3 +1,6 @@
+[registry]
+global-min-publish-age = "7 days"
+
 # Static CRT: the BonDriver DLL and the CLI need no VC++ redistributable, and the
 # cc-built C++ shim follows (/MT).
 [target.x86_64-pc-windows-msvc]
@@ -5,3 +8,18 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.i686-unknown-linux-musl]
+linker = "rust-lld"

@@ -1,0 +1,286 @@
+# The release. A tag v<version> (the version of Cargo.toml) builds the Windows and Linux
+# files on GitHub-hosted runners from the tagged commit, attests their build provenance
+# (SLSA, signed with Sigstore) and publishes them as a release, with the notes of
+# CHANGELOG.md. Run by hand (workflow_dispatch), it builds the same files as a dry run:
+# they stay as artifacts of the run, without attestations or a release.
+#
+# The build jobs get a read-only token. Only the last job, which runs nothing from the
+# repository, may write the release and sign. No cache: a release builds from scratch.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  # rust-toolchain.toml lists every target; a job installs only its own.
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    # The Gitea origin carries this file too; only the GitHub repository releases.
+    if: github.repository == 'smpn2/pix-dt295'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error file=Cargo.toml::the tag $GITHUB_REF_NAME is not v$version"
+            exit 1
+          fi
+          case $version in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # The section "## <version>" of CHANGELOG.md, up to the next "## ".
+          awk -v v="$VERSION" '/^## / { if (found) exit; found = ($2 == v); next } found' CHANGELOG.md \
+            | sed '/./,$!d' > changes.md
+          if ! grep -q . changes.md; then
+            if [ "$GITHUB_REF_TYPE" = tag ]; then
+              echo "::error file=CHANGELOG.md::no section \"## $VERSION\""
+              exit 1
+            fi
+            echo "::warning file=CHANGELOG.md::no section \"## $VERSION\""
+          fi
+          {
+            cat changes.md
+            cat <<'EOF'
+
+          ## ファイル
+
+          | ファイル | 内容 |
+          |---|---|
+          | `pix-dt295-@VERSION@-windows-<CPU>.zip` | Windows (x64, x86, arm64) の `BonDriver_DT295.dll`, `dt295.exe`, `bontest.exe` と見本の ini |
+          | `pix-dt295_*.deb` | Debian / Ubuntu のパッケージ (amd64, i386, arm64, armhf) |
+          | `pix-dt295-*.rpm` | Fedora / RHEL 系のパッケージ (x86_64, i386, aarch64, armv7hl) |
+          | `pix-dt295-*.pkg.tar.zst` | Arch Linux のパッケージ (x86_64, i686, aarch64, armv7h) |
+          | `pix-dt295-@VERSION@-linux-<CPU>.tar.gz` | そのほかの Linux 向けの、静的リンクの `dt295` と `packaging/` (x86_64, i686, aarch64, armv7) |
+          | `SHA256SUMS` | 上のファイルの SHA256 |
+
+          ファームウェアは含まない (raw-TS モードでは不要)。
+          導入の手順は同梱の INSTALL.md。
+
+          ## 検証
+
+          ファイルはすべて、GitHub Actions の `.github/workflows/release.yml` がタグ `@TAG@` のコミット `@SHA@` から GitHub ホストの runner で作成したもの。
+          それぞれに Sigstore で署名したビルドの来歴 (SLSA build provenance) を付けてあり、GitHub CLI で確認できる:
+
+          ```
+          gh attestation verify <ファイル> --repo @REPO@ --source-ref refs/tags/@TAG@ --signer-workflow @REPO@/.github/workflows/release.yml
+          ```
+
+          `SHA256SUMS` も同じく確認でき、確認した `SHA256SUMS` でほかのファイルをまとめて確認することもできる:
+
+          ```
+          sha256sum -c SHA256SUMS --ignore-missing
+          ```
+          EOF
+          } | sed "s|@VERSION@|$VERSION|g; s|@TAG@|$GITHUB_REF_NAME|g; s|@SHA@|$GITHUB_SHA|g; s|@REPO@|$GITHUB_REPOSITORY|g" \
+            > notes.md
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: notes
+          path: notes.md
+          if-no-files-found: error
+
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, name: windows-x64, test: true }
+          - { target: i686-pc-windows-msvc, name: windows-x86, test: true }
+          # built on x64; the tests would need an ARM64 machine
+          - { target: aarch64-pc-windows-msvc, name: windows-arm64, test: false }
+    env:
+      TARGET: ${{ matrix.target }}
+      NAME: pix-dt295-${{ needs.meta.outputs.version }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # the whole history: the version of the build counts the commits (src/version.rs)
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update --target $env:TARGET
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked --workspace --target $env:TARGET
+
+      - name: Build
+        run: cargo build --locked --release --target $env:TARGET -p dt295-bondriver -p dt295-cli
+
+      - name: Package
+        run: |
+          $release = "target/$env:TARGET/release"
+          $stage = "stage/$env:NAME"
+          New-Item -ItemType Directory -Force $stage, dist | Out-Null
+          Copy-Item -Destination $stage `
+            "$release/BonDriver_DT295.dll", "$release/dt295.exe", "$release/bontest.exe", `
+            src/dt295-bondriver/BonDriver_DT295.ini, README.md, INSTALL.md, LICENSE, docs/usage.md
+          Compress-Archive -Path $stage -DestinationPath "dist/$env:NAME.zip"
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  linux:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      matrix:
+        include:
+          # nfpm: the architecture in Go's names (packaging/nfpm/nfpm.yaml)
+          - { target: x86_64-unknown-linux-musl, name: linux-x86_64, nfpm: amd64, test: true }
+          - { target: i686-unknown-linux-musl, name: linux-i686, nfpm: "386", test: true }
+          # built on x86_64 with rust-lld (.cargo/config.toml); the tests would need the CPU
+          - { target: aarch64-unknown-linux-musl, name: linux-aarch64, nfpm: arm64, test: false }
+          - { target: armv7-unknown-linux-musleabihf, name: linux-armv7, nfpm: arm7, test: false }
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      NAME: pix-dt295-${{ needs.meta.outputs.version }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # the whole history: the version of the build counts the commits (src/version.rs)
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update --target "$TARGET"
+
+      - name: Test
+        if: matrix.test
+        # the crates the Arch package tests (packaging/arch/PKGBUILD)
+        run: cargo test --locked --target "$TARGET" -p dt295-usb -p dt295 -p dt295-cli
+
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET" -p dt295-cli
+
+      - name: nfpm
+        # go install checks the module against the Go checksum database.
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.45.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Package
+        run: |
+          bin=target/$TARGET/release/dt295
+          stage=stage/$NAME
+          mkdir -p "$stage/packaging" dist
+          install -m 755 "$bin" "$stage/"
+          install -m 644 README.md INSTALL.md LICENSE docs/usage.md "$stage/"
+          cp -r packaging/linux packaging/examples "$stage/packaging/"
+          # The same bytes from the same commit: the time of the commit, no owners.
+          mtime=$(git log -1 --format=%ct)
+          tar --sort=name --mtime="@$mtime" --owner=0 --group=0 --numeric-owner -C stage -cf - "$NAME" \
+            | gzip -9n > "dist/$NAME.tar.gz"
+          install -D -m 755 "$bin" target/nfpm/dt295
+          for packager in deb rpm archlinux; do
+            NFPM_ARCH=${{ matrix.nfpm }} nfpm package -f packaging/nfpm/nfpm.yaml -p "$packager" -t dist/
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [meta, windows, linux]
+    # A tag push only: workflow_dispatch can be run on a tag too, as a dry run.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # the release
+      id-token: write # the Sigstore certificate of the attestations
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: notes
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+
+      - uses: actions/attest@v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Publish
+        # A draft first: the files are all there before the release is public (and,
+        # with immutable releases, fixed).
+        run: |
+          prerelease=()
+          if [ "${{ needs.meta.outputs.prerelease }}" = true ]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$TAG" --draft --verify-tag "${prerelease[@]}" \
+            --title "pix-dt295 $VERSION" --notes-file notes.md dist/*
+          gh release edit "$TAG" --draft=false

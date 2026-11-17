@@ -119,14 +119,13 @@ pub(crate) fn write(io: &mut Io, slave: u8, data: &[u8]) -> Result<()> {
     }
     entry(io, 0, slave, data.len() as u8, Some(data))?;
     let resp = collect(io, slave)?;
-    if resp[0] == 0 {
-        Ok(())
-    } else {
-        Err(Error::Protocol(format!(
+    // A non-zero status is a NAK or the like.
+    (resp[0] == 0).ok_or_else(|| {
+        Error::Protocol(format!(
             "i2c slave 0x{slave:02x}: write status {:02x}",
             resp[0]
-        ))) // NAK etc.
-    }
+        ))
+    })
 }
 
 /// Write then read: entry sub 2 (write part) + entry sub 3 (read part).

@@ -2,21 +2,27 @@
 resolver = "3"
 members = [
     "src/dt295-usb",
+    "src/dt295-core",
+    "src/dt295-rawfw",
     "src/dt295",
     "src/dt295-bondriver",
     "src/dt295-cli",
+    "src/dt295-frmon",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.100"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
 dt295-usb = { path = "src/dt295-usb" }
+dt295-core = { path = "src/dt295-core" }
+dt295-rawfw = { path = "src/dt295-rawfw" }
 dt295 = { path = "src/dt295" }
+dt295-frmon = { path = "src/dt295-frmon" }
 
 # Windows: WinUSB / SetupAPI / file and thread APIs for the USB backend and the DLL.
 windows-sys = { version = "0.61.2", features = [

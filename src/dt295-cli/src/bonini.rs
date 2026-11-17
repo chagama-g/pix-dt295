@@ -124,15 +124,9 @@ pub fn tune(name: &str, satellite: &[(String, String)]) -> Option<Tune> {
 /// UTF-8, else the ANSI code page.
 pub fn decode_ini(b: &[u8]) -> String {
     if let Some(rest) = b.strip_prefix(b"\xFF\xFE") {
-        let units: Vec<u16> = rest
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&c| u16::from_le_bytes(c))
-            .collect();
-        return String::from_utf16_lossy(&units);
+        return String::from_utf16le_lossy(rest);
     }
-    let b = b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(b);
+    let b = b.trim_prefix(b"\xEF\xBB\xBF");
     match std::str::from_utf8(b) {
         Ok(s) => s.to_owned(),
         Err(_) => decode_ansi(b),
@@ -197,11 +191,7 @@ pub fn ini_lines(text: &str, section: &str) -> Vec<(String, String)> {
 pub fn ini_section(text: &str, section: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for (k, v) in ini_lines(text, section) {
-        let v = v
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .unwrap_or(&v)
-            .to_owned();
+        let v = v.strip_circumfix('"', '"').unwrap_or(&v).to_owned();
         out.entry(k.to_ascii_lowercase()).or_insert(v);
     }
     out

@@ -16,9 +16,9 @@ use tracing::{error, warn};
 use crate::{Error, Result};
 
 /// Firmware state register.
-pub(crate) const REG_FW_STATE: u32 = 0x82008;
+pub const REG_FW_STATE: u32 = 0x82008;
 /// Interrupt / event status register (write-1-to-clear).
-pub(crate) const REG_IRQ: u32 = 0x90074;
+pub const REG_IRQ: u32 = 0x90074;
 
 const REQ_REG: u8 = 0xBC;
 const RT_IN: u8 = 0xC0;
@@ -26,11 +26,11 @@ const RT_OUT: u8 = 0x40;
 const EP_INT: u8 = 0x83;
 
 /// Consecutive command-ack timeouts after which the firmware counts as wedged.
-pub(crate) const FW_STALL_LIMIT: u32 = 4;
+pub const FW_STALL_LIMIT: u32 = 4;
 
 /// Protocol state of one device: what every register / command exchange may need.
 #[derive(Clone)]
-pub(crate) struct Proto {
+pub struct Proto {
     /// CMDTIMER (5000 ms).
     pub cmd_timeout_ms: u32,
     /// Consecutive cmd-ack timeouts; at [`FW_STALL_LIMIT`] the firmware is wedged
@@ -75,7 +75,7 @@ impl fmt::Debug for Proto {
 }
 
 /// Sleep for `ms` milliseconds (`usbx_sleep_ms`).
-pub(crate) fn sleep_ms(ms: u64) {
+pub fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
 }
 
@@ -99,7 +99,7 @@ fn reg_setup(request_type: u8, addr: u32, masked: bool) -> Setup {
 /// address; a 2-byte-offset field goes into bytes 2..3 (value) and 6..7 (mask). Only
 /// the low 16 bits of the shifted value / mask are sent. wValue bit 0 marks the
 /// masked form.
-pub(crate) fn field_transfer(addr: u32, pos: u32, width: u32, val: u32) -> (u16, u16, [u8; 8]) {
+pub fn field_transfer(addr: u32, pos: u32, width: u32, val: u32) -> (u16, u16, [u8; 8]) {
     let mask = if width >= 32 {
         u32::MAX
     } else {
@@ -121,7 +121,7 @@ pub(crate) fn field_transfer(addr: u32, pos: u32, width: u32, val: u32) -> (u16,
 /// Byte -> BE16 word expansion of a parameter block (swap16_copy / sub_14003554C in the
 /// vendor driver): each source byte becomes the high then low half of successive BE
 /// words, i.e. a straight copy whose odd tail gets a zero low byte.
-pub(crate) fn bytes_to_words(dst: &mut [u8], src: &[u8]) {
+pub fn bytes_to_words(dst: &mut [u8], src: &[u8]) {
     for (i, &b) in src.iter().enumerate() {
         if i & 1 != 0 {
             dst[2 * (i >> 1) + 1] = b;
@@ -133,13 +133,14 @@ pub(crate) fn bytes_to_words(dst: &mut [u8], src: &[u8]) {
 }
 
 /// One device's register / command access: the USB handle plus its protocol state.
-pub(crate) struct Io<'a> {
+#[allow(missing_debug_implementations)] // holds a `&mut Proto` and a USB handle; not logged directly
+pub struct Io<'a> {
     pub usb: &'a dt295_usb::Device,
     pub p: &'a mut Proto,
 }
 
 impl<'a> Io<'a> {
-    pub(crate) fn new(usb: &'a dt295_usb::Device, p: &'a mut Proto) -> Self {
+    pub fn new(usb: &'a dt295_usb::Device, p: &'a mut Proto) -> Self {
         Io { usb, p }
     }
 
@@ -148,7 +149,7 @@ impl<'a> Io<'a> {
     }
 
     /// A vendor control OUT with the command timeout; returns the bytes sent.
-    pub(crate) fn control_out(
+    pub fn control_out(
         &self,
         request: u8,
         value: u16,
@@ -166,17 +167,11 @@ impl<'a> Io<'a> {
 
     fn expect_out(&self, s: Setup, data: &[u8]) -> Result<()> {
         let n = self.usb.control_out(s, data, self.timeout())?;
-        if n == data.len() {
-            Ok(())
-        } else {
-            Err(Error::Transfer(format!(
-                "short control OUT ({n} of {})",
-                data.len()
-            )))
-        }
+        (n == data.len())
+            .ok_or_else(|| Error::Transfer(format!("short control OUT ({n} of {})", data.len())))
     }
 
-    pub(crate) fn read16(&self, addr: u32) -> Result<u16> {
+    pub fn read16(&self, addr: u32) -> Result<u16> {
         let mut b = [0u8; 2];
         let n = self
             .usb
@@ -190,7 +185,7 @@ impl<'a> Io<'a> {
     }
 
     /// A 16-bit register read into a variable that is read again and again: store the value on success, keep the old one otherwise.
-    pub(crate) fn read16_into(&self, addr: u32, v: &mut u16) -> bool {
+    pub fn read16_into(&self, addr: u32, v: &mut u16) -> bool {
         match self.read16(addr) {
             Ok(x) => {
                 *v = x;
@@ -200,12 +195,12 @@ impl<'a> Io<'a> {
         }
     }
 
-    pub(crate) fn write16(&self, addr: u32, val: u16) -> Result<()> {
+    pub fn write16(&self, addr: u32, val: u16) -> Result<()> {
         self.expect_out(reg_setup(RT_OUT, addr, false), &val.to_be_bytes())
     }
 
     /// Masked write of `width` bits at bit `pos` ([`field_transfer`]).
-    pub(crate) fn write_field(&self, addr: u32, pos: u32, width: u32, val: u32) -> Result<()> {
+    pub fn write_field(&self, addr: u32, pos: u32, width: u32, val: u32) -> Result<()> {
         let (value, index, b) = field_transfer(addr, pos, width, val);
         self.expect_out(
             Setup {
@@ -220,7 +215,7 @@ impl<'a> Io<'a> {
 
     /// Block read: the MB86M01 stores 16-bit words; the host transfers big-endian word
     /// data in 64-byte chunks with the address advancing per chunk.
-    pub(crate) fn read_block(&self, addr: u32, buf: &mut [u8]) -> Result<()> {
+    pub fn read_block(&self, addr: u32, buf: &mut [u8]) -> Result<()> {
         for (i, chunk) in buf.chunks_mut(64).enumerate() {
             let a = addr + (i * 64) as u32;
             let want = chunk.len();
@@ -236,7 +231,7 @@ impl<'a> Io<'a> {
         Ok(())
     }
 
-    pub(crate) fn write_block(&self, addr: u32, data: &[u8]) -> Result<()> {
+    pub fn write_block(&self, addr: u32, data: &[u8]) -> Result<()> {
         for (i, chunk) in data.chunks(64).enumerate() {
             self.expect_out(reg_setup(RT_OUT, addr + (i * 64) as u32, false), chunk)?;
         }
@@ -244,7 +239,7 @@ impl<'a> Io<'a> {
     }
 
     /// Ring the command doorbell of channel `ch` (bRequest 0xB8 ch0 / 0xB9 ch1).
-    pub(crate) fn doorbell(&self, ch: u8, cmd: u8, sub: u8, par: u16) -> Result<()> {
+    pub fn doorbell(&self, ch: u8, cmd: u8, sub: u8, par: u16) -> Result<()> {
         let [ph, pl] = par.to_be_bytes();
         let req = if ch != 0 { 0xB9 } else { 0xB8 };
         self.expect_out(
@@ -261,7 +256,7 @@ impl<'a> Io<'a> {
     /// Drain one 6-byte interrupt packet (best effort; `Err(Timeout)` when none came).
     /// The state register is polled instead of parsing the payload, which the vendor
     /// driver also leaves uninspected.
-    pub(crate) fn drain_interrupt(&self, timeout_ms: u32) -> Result<()> {
+    pub fn drain_interrupt(&self, timeout_ms: u32) -> Result<()> {
         let mut b = [0u8; 6];
         match self.usb.read(EP_INT, &mut b, ms(timeout_ms)) {
             Ok(_) => Ok(()),
@@ -275,7 +270,7 @@ impl<'a> Io<'a> {
     /// 0x090074, and the per-channel ack register (ch0 0x080014, ch1 0x080016) holds the
     /// type echo (hi) and result (lo). Result 0x80 = the firmware rejected the command.
     /// The status bit is cleared with a plain 16-bit write of just that bit.
-    pub(crate) fn cmd_ack(
+    pub fn cmd_ack(
         &mut self,
         ch: u8,
         cmd: u8,
@@ -347,7 +342,7 @@ impl<'a> Io<'a> {
     /// `expect_state` (`None` = don't wait), polling every few ms. Mirrors
     /// cmd_WaitStateMsg of the vendor driver, by register polling rather than the
     /// interrupt message queue.
-    pub(crate) fn cmd(
+    pub fn cmd(
         &self,
         ch: u8,
         cmd: u8,

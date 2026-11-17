@@ -780,7 +780,7 @@ fn ini_dry_run_and_write() {
     assert!(!raw.starts_with(UTF8_BOM));
     assert_eq!(
         raw.iter().filter(|&&b| b == b'\n').count(),
-        raw.windows(2).filter(|w| *w == b"\r\n").count()
+        raw.array_windows().filter(|&w| w == b"\r\n").count()
     );
 
     // Idempotent.

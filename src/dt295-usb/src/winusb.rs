@@ -64,11 +64,7 @@ fn last_error() -> WIN32_ERROR {
 
 /// `Ok` for a successful Win32 call, else its mapped last error.
 fn check(ok: BOOL) -> Result<()> {
-    if ok != 0 {
-        Ok(())
-    } else {
-        Err(map_win_error(last_error()))
-    }
+    (ok != 0).ok_or_else(|| map_win_error(last_error()))
 }
 
 /// Whole milliseconds, rounded up so that a non-zero timeout never becomes 0 (which
@@ -678,6 +674,8 @@ impl Drop for ReadQueue<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -703,7 +701,7 @@ mod tests {
         for (code, text) in cases {
             assert_eq!(map_win_error(code).to_string(), text, "Win32 error {code}");
         }
-        assert!(matches!(map_win_error(ERROR_IO_PENDING), Error::Io(997)));
+        assert_matches!(map_win_error(ERROR_IO_PENDING), Error::Io(997));
     }
 
     #[test]
@@ -741,11 +739,11 @@ mod tests {
     #[test]
     fn open_absent_device_is_no_device() {
         // No device has VID/PID 0000:0000, so nothing is ever opened.
-        assert!(matches!(Device::open(0, 0, 0), Err(Error::NoDevice)));
-        assert!(matches!(
+        assert_matches!(Device::open(0, 0, 0), Err(Error::NoDevice));
+        assert_matches!(
             Device::open_serial(0, 0, "CD23456789"),
             Err(Error::NoDevice)
-        ));
+        );
         assert_eq!(list(0, 0).expect("enumerates"), []);
     }
 

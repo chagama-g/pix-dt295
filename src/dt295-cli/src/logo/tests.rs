@@ -732,7 +732,7 @@ fn finds_the_bondriver_inis() {
 fn bon(serial: Option<&str>, name: &str) -> BonDriver {
     BonDriver::from_ini(
         &Path::new("BD").join(name),
-        &serial.map_or(String::new(), |s| format!("[Tuner]\nDeviceSerial={s}\n")),
+        &serial.map_or_default(|s| format!("[Tuner]\nDeviceSerial={s}\n")),
     )
 }
 

@@ -28,6 +28,8 @@ pub struct Persist {
     pending_keys: Vec<[u8; 16]>,
     /// PSI as last exported from the core (or loaded).
     psi: Vec<PsiRecord>,
+    /// Raw-TS: the last-viewed (space, channel), to prime on at the next open.
+    raw_channel: Option<(u32, u32)>,
 }
 
 impl Persist {
@@ -38,6 +40,7 @@ impl Persist {
             link_key: None,
             pending_keys: Vec::new(),
             psi: Vec::new(),
+            raw_channel: None,
         }
     }
 
@@ -63,6 +66,7 @@ impl Persist {
             self.link_key = st.link_key;
         }
         self.psi = st.psi;
+        self.raw_channel = st.raw_channel;
         info!(
             "state: link key {}, {} PSI section(s) from {}",
             yes_no(self.link_key.is_some()),
@@ -130,6 +134,7 @@ impl Persist {
             link_key: self.link_key,
             pending_keys: self.pending_keys.clone(),
             psi: std::mem::take(&mut self.psi),
+            raw_channel: self.raw_channel,
         };
         let result = st.save(file);
         self.psi = st.psi;
@@ -143,6 +148,23 @@ impl Persist {
             yes_no(self.link_key.is_some()),
             self.psi.len()
         );
+    }
+
+    /// Raw-TS: remember the last-viewed `(space, channel)` to prime on at the next open, and
+    /// write the state file. Writes without reading the device (`save(None)`), so it is safe
+    /// while a raw worker owns it, and keeps the rest of the state (link key, PSI).
+    pub fn save_raw_channel(&mut self, space: u32, channel: u32) {
+        if self.raw_channel == Some((space, channel)) {
+            return;
+        }
+        self.raw_channel = Some((space, channel));
+        self.dirty = true;
+        self.save(None);
+    }
+
+    /// The last-viewed raw-TS `(space, channel)`, if the state file had one.
+    pub fn raw_channel(&self) -> Option<(u32, u32)> {
+        self.raw_channel
     }
 }
 
@@ -192,6 +214,7 @@ mod tests {
             link_key: Some([7; 16]),
             pending_keys: Vec::new(),
             psi: vec![psi_rec(20_000)],
+            raw_channel: None,
         }
         .save(&file)
         .unwrap();

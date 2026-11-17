@@ -23,7 +23,7 @@ use dt295::ts::crc::section_crc_ok;
 use dt295::ts::section::descriptors;
 use similar::TextDiff;
 
-use crate::ch2;
+use dt295::ch2;
 
 #[cfg(test)]
 mod tests;
@@ -218,7 +218,7 @@ fn emit(out: &mut dyn Write, text: &str, err: &mut dyn Write) -> u8 {
 fn load_state(path: &Path, err: &mut dyn Write) -> Result<Vec<PsiRecord>, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
-    parse_state(text.strip_prefix('\u{feff}').unwrap_or(&text), err)
+    parse_state(text.trim_prefix('\u{feff}'), err)
 }
 
 /// The PSI records of a state file's text; `Err` without a `dt295-state` header
@@ -276,7 +276,7 @@ impl ChannelNames {
         self.by_ts
             .get(&(i64::from(tsid), sid))
             .or_else(|| self.by_nid.get(&(i64::from(onid), sid)))
-            .map_or("", String::as_str)
+            .map_or_default(String::as_str)
     }
 
     fn len(&self) -> usize {

@@ -1,0 +1,16 @@
+[package]
+name = "dt295-core"
+description = "PIX-DT295 hardware primitives: register/command protocol, I2C, front end, firmware download, shared types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dt295-usb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
