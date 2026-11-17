@@ -16,8 +16,6 @@ const O_STATUS: u32 = 0x00; // bit7 busy, bit4 last ACK missing
 const O_CONTROL: u32 = 0x04; // bit7 error, bit5 restart, bit4 start, bit3 ack, bit0 done
 const O_DIVIDER: u32 = 0x08;
 const O_DATA: u32 = 0x10;
-const O_SETUP_14: u32 = 0x14; // 0x10 on setup (this instance only)
-const O_SETUP_18: u32 = 0x18; // 6 on setup (this instance only)
 
 const CT_INITIAL: u32 = 0x42;
 const DIV_SETUP: u32 = 0x3c;
@@ -50,17 +48,17 @@ fn abs_w(io: &Io, addr: u32, v: u32) -> Result<()> {
     io.write_block(addr, &v.to_be_bytes())
 }
 
-/// Clock and un-reset the instance (per a third party's analysis it "has to be clocked
-/// and un-reset before any write"), then write the divider, control and the two
-/// instance-only setup words, and confirm they took. Idempotent.
+/// Clock the instance and release its reset, then write the divider and the control and
+/// confirm they took. Idempotent. Each write is needed from a cold start (measured by a
+/// third party on a PIX-DT295, leaving out one at a time): before the clock and the reset
+/// release nothing written to the block lands, and 0xFD80C0 comes up as 3, where bit0 keeps
+/// the divider and the control from taking and bit1 makes every register read busy.
+/// 0xFD80B0 bit0 and the instance's +0x14 / +0x18 changed nothing there and are left alone.
 fn setup(io: &Io) -> Result<()> {
-    // The full gate (clock, reset release, 0x80B0, the 0x80C0 reset-hold).
+    // Read-modify-write: these registers gate other blocks too (the USB core among them).
     abs_w(io, 0x00FD_8010, abs_r(io, 0x00FD_8010)? | 0x10)?; // block clock
     abs_w(io, 0x00FD_8014, abs_r(io, 0x00FD_8014)? & !0x10)?; // reset release
-    abs_w(io, 0x00FD_80B0, abs_r(io, 0x00FD_80B0)? | 1)?;
-    abs_w(io, 0x00FD_80C0, 0)?;
-    w(io, O_SETUP_14, 0x10)?;
-    w(io, O_SETUP_18, 6)?;
+    abs_w(io, 0x00FD_80C0, abs_r(io, 0x00FD_80C0)? & !0x3)?; // the two hold bits
     w(io, O_DIVIDER, DIV_SETUP)?;
     w(io, O_CONTROL, CT_INITIAL)?;
     if r(io, O_CONTROL)? & !CT_DONE != CT_INITIAL {
@@ -92,32 +90,29 @@ pub fn demod_read(io: &Io, slave: u8, reg: u8) -> Result<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Experimental: blob-free COLD bring-up of the demod / I2C block from the host.
+// Blob-free COLD bring-up of the front end, from the host.
 //
-// Our `setup` only clocks the I2C controller instance (0xFD80xx + the controller
-// registers). A third-party host-driven driver shows that a cold
-// device also needs a board-level clock/power chain (0xFD0090 external memory,
-// the INITIALIZE clock/strap/pin writes on 0xF001F0 / 0xF100xx / 0xF101xx, the
-// 0xF10114 I2C-block enable) BEFORE the controller will actually clock a byte --
-// which is why our cold host-face read never advanced DONE. These are the facts
-// from that analysis, reproduced here over the host 0xBC window to verify on our
-// own hardware; we must drive them from the host (the main FR swallows 0x00F10xxx
-// writes cold). The 0x16xxxxx demod sub-block step of INITIALIZE is above the
-// 24-bit 0xBC window and is omitted for now (so this is the host-reachable subset).
-// Never write 0xFD8010/0xFD8014 = 0x08080000 (kills all control transfers).
+// A cold chip runs the stock boot0, which has already set the pin multiplexing for the
+// board and brought the TS endpoint up (the pump's bursts go straight into it). What is
+// left before the demods answer on this controller is what a third party established on a
+// PIX-DT295 by leaving out one write at a time from a power-up: `setup` above, the I2C
+// pins and the front-end reset. The vendor's own bring-up writes far more (the external
+// memory 0xFD0090, 0xF10080..0xF10098, the pin multiplexing 0xF1011C, the host-interface
+// word 0xF001F0, more GPIOs, 0xF1001C); none of it is needed here, so none of it is
+// written. Never write 0xFD8010/0xFD8014 = 0x08080000 (kills all control transfers).
 
-const FD0090: u32 = 0x00FD_0090;
-const F10114: u32 = 0x00F1_0114;
-const F001F0: u32 = 0x00F0_01F0;
-const F10004: u32 = 0x00F1_0004;
-const F10014: u32 = 0x00F1_0014;
-const F10018: u32 = 0x00F1_0018;
-const F1001C: u32 = 0x00F1_001C;
-const F10118: u32 = 0x00F1_0118;
-const F1011C: u32 = 0x00F1_011C;
-const F10080: [u32; 7] = [
-    0x00F1_0080, 0x00F1_0084, 0x00F1_0088, 0x00F1_008C, 0x00F1_0090, 0x00F1_0094, 0x00F1_0098,
-];
+/// The I2C pin selection: bits 21:20 = 0b10 (bits 5:4 of the high half-word, 0x8000 cold).
+/// Without it the setup passes but nothing ACKs.
+const PIN_SELECT: u32 = 0x00F1_0114;
+const PIN_MASK: u32 = 0x0030_0000;
+const PIN_I2C: u32 = 0x0020_0000;
+/// The GPIOs (16-bit registers): which pins are driven, and their levels. The System1 path
+/// resets the front end through the same two (host 0x90014 / 0x90018).
+const GPIO_DIR: u32 = 0x00F1_0014;
+const GPIO_LEVEL: u32 = 0x00F1_0018;
+/// GPIO1: the front-end (demod and tuner) reset, active low. Until it is released and
+/// driven nothing ACKs.
+const GPIO_FE_RESET: u16 = 0x0002;
 
 /// A register touched during cold bring-up, with the original value to put back.
 /// `half` = a 16-bit register (restored with `write16`), else a 32-bit word.
@@ -129,146 +124,39 @@ fn rd32(io: &Io, addr: u32) -> Result<u32> {
     Ok(u32::from_be_bytes(b))
 }
 
-/// Do the host-reachable part of the cold board bring-up, pushing every modified
-/// register's original value into `saved` as we go (so the caller can always put
-/// them back, even on a mid-sequence error). Appends a running diagnostic to `log`.
-fn cold_bringup_host(io: &Io, saved: &mut Saved, log: &mut Vec<String>) -> Result<()> {
-    // External memory (0xFD0090, 16-bit): set bit1, wait bit4 clear, clear bit1, set bit0.
-    io.write16(FD0090, io.read16(FD0090)? | 0x0002)?;
-    let mut polls = 0u32;
-    let mut cleared = false;
-    while polls < 4000 {
-        if io.read16(FD0090)? & 0x0010 == 0 {
-            cleared = true;
-            break;
-        }
-        polls += 1;
-    }
-    io.write16(FD0090, io.read16(FD0090)? & !0x0002)?;
-    io.write16(FD0090, io.read16(FD0090)? | 0x0001)?;
+/// Bring the front end up from cold: the controller ([`setup`]), the I2C pins, then the
+/// front-end reset released, the level before the drive so the pin never drives the reset
+/// level. Each write is a read-modify-write that leaves a chip already up as it is. Pushes
+/// each modified register's original value into `saved` as it goes (so the caller can put
+/// them back, even on a mid-sequence error) and a line to `log`.
+fn board_up(io: &Io, saved: &mut Saved, log: &mut Vec<String>) -> Result<()> {
+    setup(io)?;
+    let pins = rd32(io, PIN_SELECT)?;
+    saved.push((PIN_SELECT, false, pins));
+    io.write_block(PIN_SELECT, &((pins & !PIN_MASK) | PIN_I2C).to_be_bytes())?;
+    let level = io.read16(GPIO_LEVEL)?;
+    saved.push((GPIO_LEVEL, true, u32::from(level)));
+    io.write16(GPIO_LEVEL, level | GPIO_FE_RESET)?;
+    let dir = io.read16(GPIO_DIR)?;
+    saved.push((GPIO_DIR, true, u32::from(dir)));
+    io.write16(GPIO_DIR, dir | GPIO_FE_RESET)?;
+    // The System1 path waits 5 ms after the reset before the first transfer.
+    std::thread::sleep(std::time::Duration::from_millis(5));
     log.push(format!(
-        "0xFD0090 ext-mem: bit4 clear after {polls} polls ({})",
-        if cleared { "ok" } else { "TIMEOUT" }
-    ));
-
-    // 0xF10080..0x98 = 0x00010000 (write only -- reading these wedges the chip).
-    for a in F10080 {
-        io.write_block(a, &0x0001_0000u32.to_be_bytes())?;
-        saved.push((a, false, 0)); // original is treated as 0 on restore
-    }
-
-    // INITIALIZE: the vendor's clock / strap / pin bring-up (spec ch6 in the third-party
-    // host driver), minus the 0x16xxxxx demod sub-block (done later through the bank
-    // window). The register ROLES below are what a third party documented; the exact bit
-    // meanings are mostly not established, so the literal values are the observed vendor
-    // ones. Originals are saved for the restore.
-
-    // Steps 1-3: clock / pin config. 0xF10118 = 0xFFFF; 0xF1011C keeps bits 0xFA1F, sets 0x0580.
-    let o = io.read16(F10118)?;
-    saved.push((F10118, true, u32::from(o)));
-    io.write16(F10118, 0xFFFF)?;
-    let o = io.read16(F1011C)?;
-    saved.push((F1011C, true, u32::from(o)));
-    io.write16(F1011C, (o & 0xFA1F) | 0x0580)?;
-    log.push("0x16xxxxx sub-block step skipped (above 24-bit window)".into());
-
-    // Steps 7-9: the host-interface control register 0xF001F0. Four bits are selected from
-    // the board strap in 0xF10004 bits 11:10 (DT295 reads strap 2): bit28/27/26 from the
-    // strap, then bit25 unconditionally. Observed on DT295 as 0x10000000 -> 0x18000000 ->
-    // 0x1A000000, so bit25 (0x02000000) is the last to go in.
-    let f001f0 = rd32(io, F001F0)?;
-    saved.push((F001F0, false, f001f0));
-    let f10004 = io.read16(F10004)?;
-    let mut f14 = io.read16(F10014)?;
-    saved.push((F10014, true, u32::from(f14)));
-    let mut f18 = io.read16(F10018)?;
-    saved.push((F10018, true, u32::from(f18)));
-    if f001f0 & 0x4000 != 0 {
-        // The vendor sequence only documents the strap branch with bit14 clear; bail rather
-        // than guess the bit layout of the other (bit14 set) branch.
-        log.push(format!(
-            "0xF001F0=0x{f001f0:08x} bit14 set -- expected the bit14=0 strap branch; aborting"
-        ));
-        return Err(Error::State("F001F0 bit14 set (unexpected strap)".into()));
-    }
-    let strap = f001f0_strap(f10004) & 3;
-    let (a, b, c) = (strap != 0, strap == 1, strap == 2);
-    log.push(format!(
-        "strap (0xF10004>>10 & 3) = {strap} (DT295 expects 2): a={a} b={b} c={c}"
-    ));
-    let mut v = f001f0;
-    for (bit, on) in [(28u32, a), (27, c), (26, b), (25, true)] {
-        v = if on { v | (1 << bit) } else { v & !(1 << bit) };
-        io.write_block(F001F0, &v.to_be_bytes())?;
-        let back = rd32(io, F001F0)?; // each bit is written one at a time and read back
-        if back != v {
-            log.push(format!(
-                "0xF001F0 bit{bit}={on}: wrote 0x{v:08x} read 0x{back:08x} MISMATCH"
-            ));
-        }
-    }
-    log.push(format!("0xF001F0 -> 0x{:08x}", rd32(io, F001F0)?));
-
-    // Steps 10-12: the clock / reset gates 0xF10014 and 0xF10018. The strap-a branch toggles
-    // the 0x80 pair first; then 0xF10014 clears 0x200, sets 0xD000, and finally 0xF10014 |= 2
-    // with 0xF10018 &= ~2 (the vendor writes these two together and verifies both).
-    if a {
-        f14 &= 0xFF9F;
-        io.write16(F10014, f14)?;
-        f18 &= !0x80;
-        io.write16(F10018, f18)?;
-        f14 |= 0x80;
-        io.write16(F10014, f14)?;
-    }
-    f14 &= !0x200;
-    io.write16(F10014, f14)?;
-    f14 |= 0xD000;
-    io.write16(F10014, f14)?;
-    f14 |= 2;
-    f18 &= !2;
-    io.write16(F10014, f14)?;
-    io.write16(F10018, f18)?;
-
-    // 0xF1001C: a clock / reset gate (the vendor also drives it for the I2C block); drop 0x5080.
-    let o = io.read16(F1001C)?;
-    saved.push((F1001C, true, u32::from(o)));
-    io.write16(F1001C, o & !0x5080)?;
-
-    // Post-INITIALIZE enables the vendor's INITIALIZE SERVICE does: 0xF10018 = 0x0002 and
-    // 0xF1001C |= 0x0002.
-    io.write16(F10018, 0x0002)?;
-    io.write16(F1001C, io.read16(F1001C)? | 0x0002)?;
-
-    // I2C-block power: 0xF10114 |= bit21 (the vendor's I2C-block SERVICE takes it 0x80000000
-    // -> 0x80200000). This host 0xBC write landing on a cold chip is the crux of the whole
-    // approach ("A0"): if it is swallowed, nothing downstream works.
-    let before = rd32(io, F10114)?;
-    saved.push((F10114, false, before));
-    io.write_block(F10114, &(before | 0x0020_0000).to_be_bytes())?;
-    let after = rd32(io, F10114)?;
-    log.push(format!(
-        "0xF10114 (I2C block): before=0x{before:08x} after=0x{after:08x} -> {}",
-        if after & 0x0020_0000 != 0 {
-            "bit21 SET (host 0xBC write landed cold)"
-        } else {
-            "bit21 NOT SET -- host 0xBC write swallowed cold"
-        }
+        "board up: I2C pins 0x{pins:08x} -> 0x{:08x}, front-end reset released \
+         (GPIO driven 0x{dir:04x}, levels 0x{level:04x} before)",
+        rd32(io, PIN_SELECT)?
     ));
     Ok(())
 }
 
-fn f001f0_strap(f10004: u16) -> u32 {
-    u32::from(f10004) >> 10
-}
-
 // --- Host 0xBC access to 25-bit addresses via the stock boot0 bank window ---
-// A third-party host driver reaches 0x1000000+ (the demod 0x0160xxxx and capture
-// 0x0190xxxx blocks) NOT through an on-chip monitor but by the stock boot0's own bank
-// window: write the target bank into the boot0 LDI:32 immediate (write side 0xEA3D8, read
-// side 0xE9EBC) and access alias 0x80000 + (addr & 0x1FFFF). Every access stays inside the
-// 24-bit 0xBC window, and it writes the hardware registers directly (no CPU-cache step the
-// monitor's on-chip stores can get stuck in -- which is why a monitor-configured cold
-// capture engine ran but read an idle input).
+// The demod 0x0160xxxx and capture 0x0190xxxx blocks lie past the 24-bit 0xBC window. The
+// stock boot0's own bank window reaches them, as a third-party host driver does: write the
+// target bank into the boot0 LDI:32 immediate (write side 0xEA3D8, read side 0xE9EBC) and
+// access alias 0x80000 + (addr & 0x1FFFF). Every access stays inside the 24-bit window and
+// writes the hardware register itself, so the host sets the capture engine up and the
+// monitor only runs the pump.
 const WRITE_WINDOW: u32 = 0x000E_A3D8;
 const READ_WINDOW: u32 = 0x000E_9EBC;
 const ALIAS_BASE: u32 = 0x0008_0000;
@@ -314,150 +202,109 @@ fn restore_windows(io: &Io) {
     let _ = window_set(io, READ_WINDOW, 0x00F0_0000);
 }
 
-/// The demod sub-block stop of INITIALIZE (spec ch6), on 0x0160xxxx. Done through the
-/// stock bank window (host 0xBC), writing the hardware directly. Without it the capture
-/// engine free-runs on an idle input (the 0xF0 pattern) instead of the demod TS.
-fn init_demod_subblock(io: &Io, log: &mut Vec<String>) -> Result<()> {
-    let r0 = win_read32(io, 0x0160_0000)?;
-    let r4 = win_read32(io, 0x0160_0004)?;
-    let r404 = win_read32(io, 0x0160_0404)?;
-    log.push(format!(
-        "0x1600000=0x{r0:08x} (exp 0x000200FF) 0x1600004=0x{r4:08x} (exp 0x01000000) 0x1600404=0x{r404:08x}"
-    ));
-    win_write32(io, 0x0160_0404, r404 | 0x0004_0000)?;
-    win_write32(io, 0x0160_0004, 0xFFFF_FFFF)?;
-    win_write32(io, 0x0160_0000, 0xFFFF_FFFF)?;
-    win_write32(io, 0x0160_0004, 0x0080_0000)?;
-    let c4 = win_read32(io, 0x0160_0004)?;
-    let c0 = win_read32(io, 0x0160_0000)?;
-    log.push(format!(
-        "sub-block stopped: 0x1600004=0x{c4:08x} (exp 0x00800000) 0x1600000=0x{c0:08x} (bit17 {})",
-        if c0 & 0x2_0000 != 0 { "set" } else { "CLEAR" }
-    ));
-    Ok(())
-}
+// --- The capture engine (0x0190xxxx) ---
+//
+// What brings it up so the ring fills with the demod's TS, as a third party established on
+// a PIX-DT295 by leaving out one write at a time, on the first session after a power-up and
+// on a later one. What most of these registers do is not known; the comments say what
+// leaving each out did. The vendor's sequence writes far more (a 0x3002FFFF reset pulse
+// with 0x1900020, the mode word 0x1902000, most of the 0x1901xxx block, the input gate
+// 0xF12788, the demod sub-block 0x16000xx, a reset of the TS endpoint); leaving any of those
+// out changed nothing, so they are not written.
 
-/// The TS capture ring (byte offsets); the physical address the DMA writes and the length.
-const CAP_RING_PHYS: u32 = 0x0138_EC00;
-const CAP_RING_LEN: u32 = 0x0003_0000;
+/// The unit gate (16-bit): at its cold value the capture block reads 0 and drops writes.
+const UNIT_GATE: u32 = 0x00F1_0118;
+/// The capture block's wake bit: bit 18 (bit 2 of the high half-word).
+const CAP_WAKE: u32 = 0x0190_0404;
+const CAP_WAKE_BIT: u32 = 0x0004_0000;
+/// The input's run word: set by the arm, cleared by the stop.
+const CAP_INPUT_RUN: u32 = 0x0190_1040;
+/// The engine: [`CAP_RUN`] starts it, [`CAP_STOP`] stops it; it reads 0 once stopped.
+const CAP_ENGINE: u32 = 0x0190_2010;
+const CAP_RUN: u32 = 0x0200_0000;
+const CAP_STOP: u32 = 0x0400_0000;
+/// The ring's write offset; the hardware advances it.
+const CAP_RING_WRITE: u32 = 0x0190_2028;
 
-/// Capture configure table (addr, value, is_half), applied after the preamble -- a
-/// third-party host driver's ConfigureCapture entries, byte for byte. 0x1901xxx is the TS
-/// input / sync block, 0x1902xxx the ring DMA. Most values are the observed vendor ones;
-/// the few whose role is known are noted.
-const CAPTURE_TABLE: &[(u32, u32, bool)] = &[
-    (0x0190_1040, 0, false),
-    (0x0190_1064, 0, false),
-    (0x0190_10A0, 0, false),
-    (0x0190_10A4, 0, false),
-    (0x0190_10A8, 0, false),
-    (0x0190_1000, 0x0600, true),
-    (0x0190_1020, 0x0200_0000, false),
+/// The capture arm (addr, value, is_half), in order; the engine start comes after it.
+const CAPTURE_ARM: &[(u32, u32, bool)] = &[
+    // The two words at the head of the block, first: written last, nothing reached the
+    // ring on the first session after a power-up. Without either, nothing reaches it.
+    (0x0190_0000, 0x0002_0000, false),
+    (0x0190_0004, 0x0000_1100, false),
+    // The ring. Without the base or the length nothing reaches it; without the two offsets
+    // zeroed, a later session starts where the last one stopped and sends old records first.
+    (0x0190_2020, dt295_frmon::RING_BASE, false),
+    (0x0190_2024, dt295_frmon::RING_SIZE, false),
+    (CAP_RING_WRITE, 0, false),
+    (dt295_frmon::REG_RING_READ, 0, false), // the pump advances it
+    // The input selection (without it nothing reaches the ring), and the word that goes with
+    // it (without it, on the first session after a power-up, the ring fills but no record
+    // starts with 0x47).
+    (0x0190_1000, 0x0607, true),
     (0x0190_1004, 0x0400_0000, false),
-    (0x0190_1002, 0, true),
-    (0x0190_1044, 0x00BC_0000, false), // TS packet geometry (0xBC = 188 bytes)
-    (0x0190_1048, 0x4700_0000, false), // the TS sync byte (0x47) the input aligns on
-    (0x0190_104C, 0x00FF_FFFF, false),
-    (0x0190_1050, 0, false),
-    (0x0190_1060, 0, false),
+    // 0xBC = 188, the TS packet length. Without it, or 0x1901080, nothing reaches the ring.
+    (0x0190_1044, 0x00BC_0000, false),
     (0x0190_1080, 0x0100_0000, false),
-    (0x0190_1088, 0, false),
-    (0x0190_108C, 0xFFFF_FFFF, false),
-    (0x0190_1084, 0, false),
-    (0x0190_1090, 0x0100_0000, false),
-    (0x0190_2020, CAP_RING_PHYS, false), // ring base (physical)
-    (0x0190_2024, CAP_RING_LEN, false),  // ring length
-    (0x0190_2028, 0, false),             // ring write pointer (hardware advances it)
-    (0x0190_202C, 0, false),             // ring read pointer (the pump advances it)
-    (0x0190_2030, 0, false),
-    (0x0190_2000, 0x0302_0300, false), // capture format / mode (observed)
-    (0x00F1_2788, 0, true),            // TS input gate
+    (CAP_INPUT_RUN, 0x0300_0000, false),
 ];
 
-/// Configure the capture engine over the host 0xBC bank window (a third-party host
-/// driver's ConfigureCapture). Writes the hardware registers directly, NOT through the
-/// monitor. Does not start the engine (that is [`host_start_capture`], after the endpoint).
+/// Arm the capture engine over the host bank window, stopping it first if a stream left it
+/// running. Does not start it ([`host_start_capture`]).
 fn host_configure_capture(io: &Io, log: &mut Vec<String>) -> Result<()> {
-    if win_read32(io, 0x0190_2010)? != 0 {
-        log.push("warn: 0x1902010 != 0 before configure".into());
+    if win_read32(io, CAP_ENGINE)? != 0 {
+        // A stream that ended without the stop: a worker that died, or an older build.
+        log.push("capture engine still running: stopping it first".into());
+        stop_engine(io)?;
     }
-    // Preamble (values observed from the vendor's ConfigureCapture): 0x1900404 |= 0x40000
-    // enables the block; 0x1900000 = 0x3002FFFF then 0x00020000 is a reset-then-config pulse
-    // (so 0x1900020 below MUST be written after it, or the reset clears it); 0x1900004 is set
-    // around it; 0x1900020 = 0x22000200 is the bit29 a cold arm needs.
-    let r404 = win_read32(io, 0x0190_0404)?;
-    win_write32(io, 0x0190_0404, r404 | 0x0004_0000)?;
-    win_write32(io, 0x0190_0004, 0x001F_11FF)?;
-    win_write32(io, 0x0190_0000, 0x3002_FFFF)?;
-    win_write32(io, 0x0190_0000, 0x0002_0000)?;
-    win_write32(io, 0x0190_0004, 0x0000_1100)?;
-    win_write32(io, 0x0190_0020, 0x2200_0200)?;
-    // The TS-input / sync + ring-DMA table.
-    for &(addr, val, half) in CAPTURE_TABLE {
+    io.write16(UNIT_GATE, 0xFFFF)?;
+    let wake = win_read32(io, CAP_WAKE)?;
+    win_write32(io, CAP_WAKE, wake | CAP_WAKE_BIT)?;
+    if win_read32(io, CAP_WAKE)? & CAP_WAKE_BIT == 0 {
+        // The block is asleep, and nothing below would stick.
+        return Err(Error::State(
+            "capture block asleep (0x1900404 bit 18 did not take)".into(),
+        ));
+    }
+    for &(addr, val, half) in CAPTURE_ARM {
         if half {
             win_write16(io, addr, val as u16)?;
         } else {
             win_write32(io, addr, val)?;
         }
     }
-    // Postamble (observed): arm the input (0x1901000 = 0x0607), clear then set the DMA
-    // control 0x1901040 (0 -> 0x03000000), and 0x19010A4 = 0x13170400.
-    win_write16(io, 0x0190_1000, 0x0607)?;
-    win_write32(io, 0x0190_1040, 0)?;
-    win_write32(io, 0x0190_1020, 0)?;
-    win_write32(io, 0x0190_1040, 0x0300_0000)?;
-    win_write32(io, 0x0190_10A4, 0x1317_0400)?;
     log.push("capture configured over the host bank window".into());
     Ok(())
 }
 
-/// Start the capture engine: 0x1902010 = 0x02000000, over the host bank window.
+/// Start the capture engine, over the host bank window.
 fn host_start_capture(io: &Io) -> Result<()> {
-    win_write32(io, 0x0190_2010, 0x0200_0000)
+    win_write32(io, CAP_ENGINE, CAP_RUN)
 }
 
-/// The capture/endpoint protection register: write the target group before a guarded
-/// register, 0xF after.
-const PROTECT: u32 = 0x00FD_814C;
+/// How many reads of the engine to wait for it to stop (each a control transfer).
+const STOP_POLLS: u32 = 500;
 
-fn guarded(io: &Io, group: u32, addr: u32, val: u32) -> Result<()> {
-    io.write_block(PROTECT, &group.to_be_bytes())?;
-    io.write_block(addr, &val.to_be_bytes())?;
-    io.write_block(PROTECT, &0x0000_000Fu32.to_be_bytes())
-}
-
-/// SetUpUsb (the safe subset): enable the bulk-IN TS endpoint in the USB core. Done early,
-/// during board bring-up, like a third-party host driver. Host 0xBC on 0xFDBCxx; never
-/// writes 0xFD8010 / 0xFD8014 = 0x08080000 (that kills every control transfer).
-fn usb_core_enable(io: &Io, log: &mut Vec<String>) -> Result<()> {
-    guarded(io, 1, 0x00FD_BC04, 0x8500_0000)?;
-    for v in [0x04u32, 0x84] {
-        guarded(io, 8, 0x00FD_BC14, v)?;
-        guarded(io, 2, 0x00FD_BC14, v)?;
+/// Stop the capture engine: its stop word, the input's run word cleared, then the engine read
+/// back at 0. Measured by a third party on a PIX-DT295: left running, the next session's TS
+/// has a continuity error; with the run word left set, often only about 64 % of the next
+/// stream reaches the host.
+fn stop_engine(io: &Io) -> Result<()> {
+    win_write32(io, CAP_ENGINE, CAP_STOP)?;
+    win_write32(io, CAP_INPUT_RUN, 0)?;
+    for _ in 0..STOP_POLLS {
+        if win_read32(io, CAP_ENGINE)? == 0 {
+            return Ok(());
+        }
     }
-    log.push("USB core bulk-IN endpoint enabled".into());
-    Ok(())
+    Err(Error::Timeout("capture engine did not stop"))
 }
 
-/// StartEndpoint: reset the TS endpoint, set its ring buffer address, enable it. A
-/// third-party host driver does this AFTER configuring the capture engine (the capture
-/// block reset in CONFIGURE would otherwise disturb it), so the cold arm calls it between
-/// the capture configure pass and the capture start.
-fn start_endpoint(io: &Io, log: &mut Vec<String>) -> Result<()> {
-    let saved14 = rd32(io, 0x00FD_BC14)?;
-    guarded(io, 8, 0x00FD_BD08, 1)?;
-    io.write_block(PROTECT, &0x0000_0006u32.to_be_bytes())?;
-    io.write_block(0x00FD_BD08, &0x00FF_6000u32.to_be_bytes())?;
-    let buffer = rd32(io, 0x00FD_BD08)?;
-    io.write_block(0x00FD_BD08, &buffer.to_be_bytes())?;
-    io.write_block(PROTECT, &0x0000_000Fu32.to_be_bytes())?;
-    let enable = saved14 & 0xFFFD_FFFD;
-    guarded(io, 2, 0x00FD_BC14, enable)?;
-    guarded(io, 8, 0x00FD_BC14, enable)?;
-    log.push(format!(
-        "TS endpoint started (0xFDBC14=0x{enable:08x}, buffer=0x{buffer:08x})"
-    ));
-    Ok(())
+/// Stop the capture engine at the end of a stream, and put the bank window back.
+pub fn stop_capture(io: &Io) -> Result<()> {
+    let stopped = stop_engine(io);
+    restore_windows(io);
+    stopped
 }
 
 /// Put the saved registers back, in reverse order.
@@ -544,16 +391,15 @@ fn cold_xfer_read(io: &Io, slave: u8, reg: u8, log: &mut Vec<String>) -> Result<
     Ok(val)
 }
 
-/// Experimental blob-free cold read: do the host board bring-up, set up the I2C
-/// controller, and read one demod register with full diagnostics. `restore` puts the
-/// board registers back afterwards (cheap re-runs without a re-plug). Returns the
-/// register value and the step-by-step report. The demod is 7-bit slave 0x10.
+/// Blob-free cold read: bring the front end up ([`board_up`]) and read one demod register
+/// with full diagnostics. `restore` puts the board registers back afterwards, which holds
+/// the front end in reset again. Returns the register value and the step-by-step report.
+/// The demod is 7-bit slave 0x10.
 pub fn demod_read_cold(io: &Io, slave: u8, reg: u8, restore: bool) -> (Result<u8>, Vec<String>) {
     let mut log = Vec::new();
     let mut saved: Saved = Vec::new();
     let result = (|| {
-        cold_bringup_host(io, &mut saved, &mut log)?;
-        setup(io)?;
+        board_up(io, &mut saved, &mut log)?;
         log.push(format!(
             "I2C setup: CONTROL=0x{:04x} DIVIDER=0x{:04x} STATUS=0x{:04x}",
             r(io, O_CONTROL)?,
@@ -570,14 +416,12 @@ pub fn demod_read_cold(io: &Io, slave: u8, reg: u8, restore: bool) -> (Result<u8
 }
 
 /// Shared blob-free COLD arm, all host-side. With `full` (the first tune after a cold
-/// re-plug / open) it does the whole bring-up: install the monitor (which runs our on-chip
-/// TS pump), bring up the board over the 0xBC window, stop the demod sub-block, enable the
-/// USB core and run the demod's one-time INITIALIZE. On a later channel change (`full` =
-/// false) all of that is already up on the chip, so it is skipped and only the retune +
-/// capture rearm run (~1 s instead of ~2.5 s). Always: tune and lock over the host-face
-/// I2C, configure the capture engine over the stock bank window (DIRECT to the hardware
-/// registers -- not the monitor, whose on-chip stores can sit in CPU cache and never reach
-/// it), bring up the TS endpoint, start the engine. Returns whether the demod locked.
+/// re-plug / open) it does the whole bring-up: the front end ([`board_up`]), the demod's
+/// one-time INITIALIZE, and the monitor (which runs our on-chip TS pump). On a later
+/// channel change (`full` = false) all of that is already up on the chip, so it is skipped
+/// and only the retune + capture rearm run (~1 s instead of ~2.5 s). Always: tune and lock
+/// over the host-face I2C, arm the capture engine over the stock bank window, start it.
+/// Returns whether the demod locked.
 fn cold_arm(
     io: &Io,
     terrestrial: bool,
@@ -588,52 +432,39 @@ fn cold_arm(
     log: &mut Vec<String>,
 ) -> Result<bool> {
     use crate::frmon_host;
-    use fe1::Bus as _;
 
     // Gate first (full path only), read-only, BEFORE any board write: a chip that is not
     // pristine stock boot0 (e.g. vendor firmware running) is refused here without the board
     // bring-up touching it. If our monitor is already installed -- a CLI cold-* command re-run
-    // without a re-plug -- downgrade to a retune instead of a second full bring-up, which would
-    // fault the already-up chip. The monitor itself is written later (after power_on_init); it
-    // coexists with host-face 0xBC access and the bank window (only the staging dispatch), so
-    // the capture engine is still configured directly.
+    // without a re-plug -- downgrade to a retune: the front end is up and initialized. The
+    // monitor itself is written later (after power_on_init); it coexists with host-face 0xBC
+    // access and the bank window (only the staging dispatch), so the capture engine is still
+    // configured directly.
     let full = if full {
         !frmon_host::install_check(io)?
     } else {
         false
     };
     if full {
-        cold_bringup_host(io, saved, log)?;
-        init_demod_subblock(io, log)?;
-    }
-    setup(io)?; // clock/ready the host-face I2C controller (idempotent; cheap on a retune)
-    if full {
-        usb_core_enable(io, log)?;
-        // Power the front end up, then write the monitor: after the board is up but before the
-        // tune and capture. Its BODY is the "brought up" marker (`monitor_installed`), so a
-        // tune/capture failure below keeps it and the next tune only retunes, while a failure
-        // in the bring-up above leaves it absent and the next tune redoes the bring-up (never a
-        // second full bring-up of an already-up chip, which faults).
+        board_up(io, saved, log)?;
+        // Initialize the front end, then write the monitor: after the board is up but before
+        // the tune and capture. Its BODY is the "brought up" marker (`monitor_installed`), so
+        // a tune/capture failure below keeps it and the next tune only retunes, while a
+        // failure in the bring-up above leaves it absent and the next tune redoes the bring-up.
         {
             let mut bus = FjBus::new(io);
             fe1::power_on_init(&mut bus)?;
         }
         frmon_host::install_write(io)?;
+    } else {
+        setup(io)?; // the host-face I2C controller (idempotent; cheap on a retune)
     }
     let locked = {
         let mut bus = FjBus::new(io);
         let sys = if terrestrial {
-            // The demod INITIALIZE close the vendor front end relies on (0x47/0x4F/0x72): in
-            // the vendor-bootstrapped path the resident wrote these, so fe1 omits them; cold
-            // there is no resident, and without 0x4F=0x05 the T demod does not drive valid TS
-            // onto the capture bus (the engine then reads an idle 0xF0 pattern). 0x70 = 0x18 is
-            // a third-party host driver's captured value (fe1's other capture has 0x38; bit5
-            // differs). Written before every terrestrial tune, not just the first bring-up, so a
-            // bring-up that first locked a BS/CS channel still gets it on the switch to terrestrial.
-            bus.i2c_write(0x20, &[0x70, 0x18])?;
-            for rv in [[0x47u8, 0x00u8], [0x4F, 0x05], [0x72, 0x00]] {
-                bus.i2c_write(0x20, &rv)?;
-            }
+            // The same captured sequence as the System1 path. The T demod's 0x47 / 0x4F / 0x72
+            // read 0x00 / 0x05 / 0x00 from a power-up on (and after a satellite tune), so there
+            // is nothing to write there.
             fe1::tune_t(&mut bus, freq_hz)?;
             System::Terrestrial
         } else {
@@ -649,10 +480,8 @@ fn cold_arm(
         ));
         st.locked
     };
-    // A third-party host driver's arm order, all host-side over the bank window: configure
-    // the capture engine, bring the TS endpoint up, then start the engine last.
+    // After the lock: arm the capture engine, then start it.
     host_configure_capture(io, log)?;
-    start_endpoint(io, log)?;
     host_start_capture(io)?;
     log.push("capture started (0x1902010 = 0x02000000, host window)".into());
     Ok(locked)
@@ -697,23 +526,22 @@ fn reframe_188(buf: &[u8], phase: usize) -> Vec<u8> {
     out
 }
 
-/// Experimental blob-free COLD capture arm (wall C): `cold_arm`, then check the TS
-/// ring's write pointer advances -- TS flowing from the demod into the capture ring with
-/// no resident, no aux core, no vendor firmware. Leaves chip state up (re-plug to reset).
+/// Blob-free COLD capture arm: `cold_arm`, then check the TS ring's write pointer advances
+/// -- TS flowing from the demod into the capture ring with no resident, no aux core, no
+/// vendor firmware. Leaves the engine running (the next arm stops it first).
 pub fn cold_capture(
     io: &Io,
     terrestrial: bool,
     freq_hz: u32,
     tsid: Option<u16>,
 ) -> (Result<bool>, Vec<String>) {
-    const RING_WRITE: u32 = 0x0190_2028;
     let mut log = Vec::new();
     let mut saved: Saved = Vec::new();
     let result = (|| -> Result<bool> {
         let locked = cold_arm(io, terrestrial, freq_hz, tsid, true, &mut saved, &mut log)?;
-        let rp0 = win_read32(io, RING_WRITE)?;
+        let rp0 = win_read32(io, CAP_RING_WRITE)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let rp1 = win_read32(io, RING_WRITE)?;
+        let rp1 = win_read32(io, CAP_RING_WRITE)?;
         let flowing = rp1 != rp0;
         log.push(format!(
             "ring write ptr 0x1902028: 0x{rp0:08x} -> 0x{rp1:08x} => {}",
@@ -729,10 +557,11 @@ pub fn cold_capture(
     (result, log)
 }
 
-/// Experimental blob-free COLD stream (end to end): `cold_arm`, upload our TS pump, then
-/// loop CALLing the pump and reading EP 0x81 for `secs`, counting bytes and TS sync. The
-/// whole datapath -- demod power, tune, capture arm, ring->EP pump -- runs with no
-/// resident, no aux core and no vendor firmware. Returns (bytes, sync fraction).
+/// Blob-free COLD stream (end to end): `cold_arm`, upload our TS pump, then loop CALLing
+/// the pump and reading EP 0x81 for `secs`, counting bytes and TS sync, and stop the
+/// capture engine. The whole datapath -- demod power, tune, capture arm, ring->EP pump --
+/// runs with no resident, no aux core and no vendor firmware. Returns (bytes, sync
+/// fraction).
 pub fn cold_stream(
     io: &Io,
     terrestrial: bool,
@@ -806,7 +635,9 @@ pub fn cold_stream(
         }
         Ok((total, sync))
     })();
-    restore_windows(io);
+    if let Err(e) = stop_capture(io) {
+        log.push(format!("capture stop: {e}"));
+    }
     (result, log)
 }
 
@@ -830,10 +661,10 @@ pub fn cold_prepare_stream(
         tracing::info!("cold raw-TS: {line}");
     }
     // Always put the bank window back to its default, even if cold_arm failed after moving it
-    // (capture configure / demod sub-block): the worker's pump streams over the staging
-    // dispatch, not the window, and a stale capture-bank immediate would mis-map a later direct
-    // 0x80000..0x9FFFF access (e.g. the boot-state register 0x82008, the System1 start's reads).
-    // cold_capture / cold_stream restore it the same way on every path.
+    // (in the capture configure): the worker's pump streams over the staging dispatch, not the
+    // window, and a stale capture-bank immediate would mis-map a later direct 0x80000..0x9FFFF
+    // access (e.g. the boot-state register 0x82008, the System1 start's reads). cold_capture /
+    // cold_stream restore it the same way on every path.
     restore_windows(io);
     let locked = armed?;
     crate::frmon_host::upload_ts_pump(io)?;
@@ -945,10 +776,10 @@ impl fe1::Bus for FjBus<'_, '_> {
     }
 }
 
-/// Experimental blob-free COLD tune: host board bring-up, host-face I2C set-up, then run
-/// fe1's captured front-end init + tune over the host face and read the lock / C/N. No
-/// resident, no aux core, no vendor firmware. Proves the demod not only powers but locks
-/// a real channel from cold. `restore` puts the board registers back afterwards.
+/// Blob-free COLD tune: bring the front end up ([`board_up`]), then run fe1's captured
+/// front-end init + tune over the host face and read the lock / C/N. No resident, no aux
+/// core, no vendor firmware. `restore` puts the board registers back afterwards, which holds
+/// the front end in reset again.
 pub fn cold_tune(
     io: &Io,
     terrestrial: bool,
@@ -959,8 +790,7 @@ pub fn cold_tune(
     let mut log = Vec::new();
     let mut saved: Saved = Vec::new();
     let result = (|| {
-        cold_bringup_host(io, &mut saved, &mut log)?;
-        setup(io)?;
+        board_up(io, &mut saved, &mut log)?;
         log.push(format!(
             "I2C setup: CONTROL=0x{:04x} DIVIDER=0x{:04x}",
             r(io, O_CONTROL)?,

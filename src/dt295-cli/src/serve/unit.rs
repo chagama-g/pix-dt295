@@ -496,7 +496,7 @@ impl<'a> Unit<'a> {
             self.dev = Some(dev);
             return None;
         }
-        // the cold bootstrap takes about 10 s; wait (bounded) for the first TS
+        // the cold bootstrap and the lock wait take seconds; wait (bounded) for the first TS
         if !wait_raw_ts(&dev, &pipe, RAW_FIRST_TS) {
             // The worker ends on its own, in about a tune's time: with nothing (Ok) when the
             // demod does not lock, with the error when the bring-up fails. Only a worker

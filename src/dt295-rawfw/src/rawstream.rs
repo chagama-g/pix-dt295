@@ -29,10 +29,9 @@ const BULK_READ_BYTES: usize = 61_440;
 ///
 /// usbfs (Linux): few. The stream's end cancels every posted read, about 3 ms each on an
 /// EHCI host (measured on a 4.9 kernel: 48 took ~150 ms), and while it runs the controller
-/// holds back the control transfers of every device on it: another unit's pump among them,
-/// whose ring then overflows (TS lost on a stream that was fine). 8 x 64 KiB cancel in
-/// ~25 ms, and still hold ~100 ms of a full CS transponder for the (raised-priority) stream
-/// thread to reap.
+/// holds back the control transfers of every device on it: another unit's pump among them.
+/// 8 x 64 KiB cancel in ~25 ms and hold ~100 ms of a full CS transponder for the stream
+/// thread to reap; past that the on-chip ring holds the TS.
 const RQ_N: usize = cfg_select! {
     windows => 48,
     _ => 8,
@@ -43,12 +42,15 @@ const REAP_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// How often the loop pumps the ring to EP 0x81.
 const PUMP_EVERY: Duration = Duration::from_millis(2);
-/// A pump interval past this is counted as late: half of what the ring holds of a full CS
-/// transponder (192 KiB at ~4.9 MB/s, ~40 ms). Past the whole of it the ring overflows.
-const LATE_PUMP: Duration = Duration::from_millis(20);
-/// A pump interval this long is reported at once: about what the ring holds of a full CS
-/// transponder, so the ring has likely overflowed.
-const OVERFLOW_PUMP: Duration = Duration::from_millis(40);
+/// A full CS transponder, the fastest stream: about 4.9 MB/s (the demod drops the dummy
+/// slots, S reg 0x8E bit 1). BS and terrestrial streams are slower.
+const FULL_RATE: u64 = 4_900_000;
+/// A pump interval this long is reported at once: what the on-chip ring holds of a full CS
+/// transponder (4 MiB, ~0.85 s), so the ring has likely overflowed.
+const OVERFLOW_PUMP: Duration =
+    Duration::from_millis(dt295_frmon::RING_SIZE as u64 * 1000 / FULL_RATE);
+/// A pump interval past this is counted as late: half of [`OVERFLOW_PUMP`].
+const LATE_PUMP: Duration = Duration::from_millis(dt295_frmon::RING_SIZE as u64 * 500 / FULL_RATE);
 /// How often the loop reports losses while it streams (only when there were any, see
 /// [`RawCaptureStats::lossy`]: late pumps or damaged packets alone are no loss).
 const LOSS_REPORT: Duration = Duration::from_secs(10);
@@ -67,7 +69,7 @@ pub struct RawCaptureStats {
     /// Packets the demodulator flagged as damaged (transport_error_indicator): a weak
     /// signal, not a late pump.
     pub error_packets: u64,
-    /// Pump intervals longer than `LATE_PUMP` (20 ms).
+    /// Pump intervals longer than `LATE_PUMP` (~0.4 s).
     pub late_pumps: u64,
     /// The longest interval between two pumps.
     pub max_pump_gap: Duration,
@@ -96,9 +98,10 @@ impl RawCaptureStats {
 /// The raw-TS worker's duration cap, effectively unbounded (a channel change or the client
 /// going away stops it first). Shared by the BonDriver and the daemon.
 pub const RAW_STREAM_CAP: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-/// How long to wait for the first TS after starting a raw-TS stream. The cold bring-up is
-/// slow (about 10 s before the tune and lock); it MUST exceed that, or stopping the wait
-/// mid-bring-up aborts the pre-tune EP queue and faults the tune.
+/// How long to wait for the first TS after starting a raw-TS stream: past the cold bring-up
+/// (about 1 s before the tune) and the lock wait (up to ~8 s on a satellite). It MUST
+/// exceed both, or stopping the wait mid-bring-up aborts the pre-tune EP queue and faults
+/// the tune.
 pub const RAW_FIRST_TS: Duration = Duration::from_secs(30);
 /// How long a running raw-TS stream may deliver no TS before it is a stalled datapath. A
 /// halt never faults the worker, so the received-byte count is the only liveness signal.
@@ -264,12 +267,35 @@ pub fn run_cold_stream(
         if locked { "locked" } else { "NO LOCK" },
         f64::from(freq_hz) / 1e6
     );
-    if !locked {
+    let streamed = if locked {
+        pump_stream(io, terrestrial, duration, stop, sink, cn_report)
+    } else {
         // An unlocked demod produces no TS, so end now rather than pump an empty ring for
         // the host's whole first-TS timeout: an off-air / empty channel then reports no
         // stream in the ~2 s of a tune, not ~30 s.
-        return Ok(RawCaptureStats::default());
+        Ok(RawCaptureStats::default())
+    };
+    // Stop the engine the arm started, so the next arm starts from a stopped one. Not after
+    // an unplug: the device is gone.
+    let unplugged = matches!(&streamed, Err(Error::State(why)) if why == UNPLUGGED);
+    if !unplugged && let Err(e) = crate::fjcore::stop_capture(io) {
+        warn!("raw-TS cold: capture stop: {e}");
     }
+    streamed
+}
+
+const UNPLUGGED: &str = "device unplugged during cold stream";
+
+/// The stream loop of [`run_cold_stream`], once the demod has locked: pump the ring to EP
+/// 0x81 and reframe to the sink until `stop` (or `duration`).
+fn pump_stream(
+    io: &Io,
+    terrestrial: bool,
+    duration: Duration,
+    stop: Option<&AtomicBool>,
+    sink: &mut TsSink,
+    cn_report: Option<&dyn Fn(i32)>,
+) -> Result<RawCaptureStats> {
     let _ = io.usb.abort_pipe(EP_TS);
     // Past the bring-up, from here on a late pump loses TS (the module doc of `prio`).
     match crate::prio::raise_stream_threads() {
@@ -305,7 +331,7 @@ pub fn run_cold_stream(
         // Keep the FIFO fed, but cap the pump rate: one pump drains up to 32 KiB, so ~2 ms
         // between pumps (16 MB/s) is well above the ~5 MB/s of a full CS transponder, while
         // cutting the control-transfer traffic of pumping on every (sub-millisecond) loop
-        // pass. Each interval is timed: one past the ring's ~40 ms loses TS.
+        // pass. Each interval is timed: one past what the ring holds (~0.85 s) loses TS.
         if last_pump.elapsed() >= PUMP_EVERY {
             let now = Instant::now();
             if let Some(prev) = pump_started {
@@ -337,7 +363,7 @@ pub fn run_cold_stream(
                 Ok(None) => {}
                 Err(dt295_usb::Error::Timeout) | Err(dt295_usb::Error::Cancelled) => {}
                 Err(dt295_usb::Error::NoDevice) => {
-                    return Err(Error::State("device unplugged during cold stream".into()));
+                    return Err(Error::State(UNPLUGGED.into()));
                 }
                 Err(e) => return Err(Error::Usb(e)),
             },
@@ -349,7 +375,7 @@ pub fn run_cold_stream(
                 Ok(_) => {}
                 Err(dt295_usb::Error::Timeout) | Err(dt295_usb::Error::Cancelled) => {}
                 Err(dt295_usb::Error::NoDevice) => {
-                    return Err(Error::State("device unplugged during cold stream".into()));
+                    return Err(Error::State(UNPLUGGED.into()));
                 }
                 Err(e) => return Err(Error::Usb(e)),
             },

@@ -578,15 +578,27 @@ pub fn monitor() -> Monitor {
     }
 }
 
-/// Capture ring and EP registers the TS pump drives (DT295, from the resident's
-/// capture/EP code). The ring read/write pointers are byte offsets into the ring.
-pub const RING_BASE_CPU: u32 = 0x8138_ec00; // 0x0138ec00 | 0x80000000
-pub const RING_SIZE: u32 = 0x0003_0000;
+/// Capture ring and EP registers the TS pump drives (DT295). The ring read/write pointers
+/// are byte offsets into the ring.
+///
+/// The ring: 4 MiB of SDRAM at 0x02000000, which holds about 0.85 s of a full CS
+/// transponder (~4.9 MB/s), so the host may call the pump that late before TS is lost. The
+/// vendor's 192 KiB ring held about 40 ms, and it overflows even on a terrestrial channel
+/// when the host stalls (measured by a third party on a PIX-DT295, which also ran its ring
+/// at 0x02000000). The length is a multiple of the 192-byte record, so the hardware wraps
+/// on a record boundary, and of the 512-byte burst, so no burst is ever cut short at the
+/// ring end; the length register keeps only multiples of 64.
+pub const RING_BASE: u32 = 0x0200_0000; // physical, what the capture DMA writes
+pub const RING_BASE_CPU: u32 = RING_BASE | 0x8000_0000; // the CPU view
+pub const RING_SIZE: u32 = 0x003f_fc00; // 2730 x 1536 (lcm of 192 and 512)
 pub const REG_RING_WRITE: u32 = 0x0190_2028; // hardware write offset
 pub const REG_RING_READ: u32 = 0x0190_202c; // consumer offset (we write it back)
 pub const EP_FIFO: u32 = 0x00fd_bd84; // 32-bit FIFO data port
 pub const EP_FIFO_CTRL: u32 = 0x00fd_bd0c; // bit2 = ready; write 4 = commit
-pub const EP_GUARD: u32 = 0x00fd_814c; // guarded-access latch (8 .. 0xF)
+/// The byte lanes a 32-bit store writes, bit0 = the most significant byte (0xF, all four, is
+/// the default). The commit writes 8 first, so its store of 4 to [`EP_FIFO_CTRL`] lands in
+/// the low byte only, then puts 0xF back.
+pub const EP_BYTE_ENABLE: u32 = 0x00fd_814c;
 /// TS record geometry: 192-byte ring records = 188 TS bytes + a 4-byte suffix.
 pub const RECORD_BYTES: u32 = 192;
 pub const TS_BYTES: u32 = 188;
@@ -598,6 +610,15 @@ pub const PUMP_BATCH: u8 = 64;
 /// uses), far fewer commits than one per TS packet. The tail burst at the ring end
 /// is shorter.
 pub const FIFO_BLOCK_BYTES: u32 = 512;
+
+// The ring wraps on a record and after a whole burst, the length register holds it (multiples
+// of 64), and it stays within the 4 MiB at 0x02000000.
+const _: () = assert!(
+    RING_SIZE.is_multiple_of(RECORD_BYTES)
+        && RING_SIZE.is_multiple_of(FIFO_BLOCK_BYTES)
+        && RING_SIZE.is_multiple_of(64)
+        && RING_SIZE <= 0x0040_0000
+);
 
 /// How long the pump spins for the EP FIFO to become ready before giving up for this
 /// call. The FIFO drains to the host's queued (async) EP reads at USB speed, so it is
@@ -632,19 +653,19 @@ pub fn ts_pump() -> Vec<u8> {
     a.ldi32(REG_RING_WRITE, R1);
     a.ld(R1, R3);
 
-    // available = (W - R) mod ring size, into r0.
+    // available = (W - R) mod ring size, into r0. The ring size is past ldi20's 20 bits.
     a.mov(R3, R0);
     a.subn(R2, R0); // r0 = W - R (two's complement)
-    a.ldi20(RING_SIZE - 1, R1);
+    a.ldi32(RING_SIZE - 1, R1);
     a.cmp(R1, R0);
     a.bls("have_avail"); // r0 <= ring_size-1 => W >= R, value is the avail
-    a.ldi20(RING_SIZE, R1);
+    a.ldi32(RING_SIZE, R1);
     a.addn(R1, R0); // wrapped: avail = W - R + ring_size
     a.label("have_avail");
 
     // burst = min(512, ring_size - R), in r5. Clamping to the ring end means a burst
     // never straddles the wrap, and the tail burst lands R back on 0.
-    a.ldi20(RING_SIZE, R5);
+    a.ldi32(RING_SIZE, R5);
     a.subn(R2, R5); // r5 = ring_size - R (bytes to the ring end)
     a.ldi20(FIFO_BLOCK_BYTES, R1);
     a.cmp(R1, R5);
@@ -690,19 +711,19 @@ pub fn ts_pump() -> Vec<u8> {
     a.cmp(R1, R3);
     a.bne("copyw");
 
-    // Guard-commit: 0xFD814C=8, 0xFDBD0C=4, 0xFD814C=0xF.
-    a.ldi32(EP_GUARD, R1);
+    // Commit, the low byte only: 0xFD814C=8, 0xFDBD0C=4, 0xFD814C=0xF.
+    a.ldi32(EP_BYTE_ENABLE, R1);
     a.ldi8(8, R0);
     a.st(R0, R1);
     a.ldi32(EP_FIFO_CTRL, R3);
     a.ldi8(4, R0);
     a.st(R0, R3);
     a.ldi8(0xf, R0);
-    a.st(R0, R1); // r1 still EP_GUARD
+    a.st(R0, R1); // r1 still EP_BYTE_ENABLE
 
     // Advance the read offset by the burst, wrapping at the ring end.
     a.addn(R5, R2); // R += burst
-    a.ldi20(RING_SIZE, R1);
+    a.ldi32(RING_SIZE, R1);
     a.cmp(R1, R2);
     a.bne("nowrap");
     a.ldi8(0, R2);

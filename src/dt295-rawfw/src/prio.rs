@@ -1,14 +1,14 @@
 //! Scheduling priority for the raw-TS stream.
 //!
-//! The on-chip capture ring holds only tens of ms of TS (a full CS transponder fills its
-//! 192 KiB in about 40 ms), and nothing drains it but the host's pump CALL. A stream thread
-//! that the OS leaves waiting behind busier, higher-priority threads (a recorder parsing
-//! the TS, an EPG scan) calls the pump late, the ring overflows, and the TS is lost. So the
-//! stream asks for a priority above normal work: for its own thread, which is the worker's,
-//! spawned for this one stream (nothing to restore), and, on Linux, for the USB backend's
-//! event thread, which completes every transfer the stream waits on. That thread is one per
-//! process, shared by every unit, and stays raised once a stream has raised it: it only
-//! wakes for USB completions.
+//! Nothing drains the on-chip capture ring but the host's pump CALL, and the ring holds
+//! under a second of TS (a full CS transponder fills its 4 MiB in about 0.85 s). A stream
+//! thread that the OS leaves waiting behind busier, higher-priority threads (a recorder
+//! parsing the TS, an EPG scan) that long calls the pump late, the ring overflows, and the
+//! TS is lost. So the stream asks for a priority above normal work: for its own thread,
+//! which is the worker's, spawned for this one stream (nothing to restore), and, on Linux,
+//! for the USB backend's event thread, which completes every transfer the stream waits on.
+//! That thread is one per process, shared by every unit, and stays raised once a stream has
+//! raised it: it only wakes for USB completions.
 //!
 //! An unprivileged process gets either only within its limits: `RLIMIT_RTPRIO` of at least
 //! 1 for SCHED_FIFO, `RLIMIT_NICE` of at least 30 (nice -10) for the fallback (systemd:

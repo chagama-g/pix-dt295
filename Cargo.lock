@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "dt295"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes",
  "cbc",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "dt295-bondriver"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cc",
  "dt295",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "dt295-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "dt295-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dt295-usb",
  "thiserror",
@@ -356,11 +356,11 @@ dependencies = [
 
 [[package]]
 name = "dt295-frmon"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "dt295-rawfw"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dt295-core",
  "dt295-frmon",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "dt295-usb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nusb",
  "thiserror",
