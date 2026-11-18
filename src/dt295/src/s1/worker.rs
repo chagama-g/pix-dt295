@@ -283,8 +283,8 @@ impl Minute {
         }
     }
 
-    fn demod(&mut self, now: Instant, lock: u8, cnx: i32, eb: u32, f0: u32) {
-        if lock != 0x00 {
+    fn demod(&mut self, now: Instant, locked: bool, cnx: i32, eb: u32, f0: u32) {
+        if !locked {
             self.unlock += 1;
         }
         self.cn = Some(match self.cn {
@@ -892,13 +892,13 @@ impl<'a> Run<'a> {
                 warn!("s1: demod sample failed; not sampling for this stream");
             }
             Ok((lock, cn, eb, f0)) => {
-                let mdb = if self.dm_sat {
-                    cn_s_mdb(cn)
+                let (locked, mdb) = if self.dm_sat {
+                    (fe1::s_locked(lock), cn_s_mdb(cn))
                 } else {
-                    cn_t_mdb(cn)
+                    (fe1::t_locked(lock), cn_t_mdb(cn))
                 };
                 self.sh.live.publish_cn(mdb); // the host's live signal level
-                self.win.demod(now, lock, mdb / 100, eb, f0);
+                self.win.demod(now, locked, mdb / 100, eb, f0);
             }
         }
     }
@@ -1096,7 +1096,7 @@ mod tests {
         let mut m = Minute::new(3, Instant::now());
         m.bytes = 50 << 20;
         m.gap_ms = 100;
-        m.demod(m.t0, 0, 245, 0, 0);
+        m.demod(m.t0, true, 245, 0, 0);
         assert!(m.line(true).is_none());
     }
 
@@ -1124,8 +1124,8 @@ mod tests {
              TEI 4, error seconds: 05(300K) 17(2K) [per-second max 1059K, median 1030K], \
              longest gap 140 ms, 3.5 MB"
         );
-        m.demod(t0, 1, 123, 5, 0);
-        m.demod(t0 + Duration::from_secs(7), 0, 98, 0, 0);
+        m.demod(t0, false, 123, 5, 0);
+        m.demod(t0 + Duration::from_secs(7), true, 98, 0, 0);
         assert!(
             m.line(false)
                 .unwrap()

@@ -210,13 +210,44 @@ pub fn power_on_init(b: &mut impl Bus) -> Result<()> {
 /// Lock polls in a row with bit 7 of demod reg 0x80 set after which an ISDB-T channel
 /// counts as empty (~0.9 s at ~56 ms a poll). Hardware 2026-10-19, a UHF scan: on all
 /// 40 empty channels 0x80 went 0x2f -> 0xaf within 0.2 s and stayed there; on the 10
-/// present ones bit 7 never showed (0x2f -> 0x2e/0x0e -> 0x06 -> 0x02 -> 0x00, lock in
-/// 0.7-1.0 s).
+/// present ones bit 7 never showed (0x2f -> 0x2e/0x0e -> 0x06 -> 0x02 -> 0x00 in
+/// 0.7-1.0 s). Hardware 2026-11-17: bit 2 can also clear after bit 1 (0x06 -> 0x04 ->
+/// 0x00), which [`t_locked`] takes as lock at 0x04.
 const T_NO_SIGNAL_POLLS: u32 = 16;
 
-/// Poll demod reg 0x80 until lock (0x00) or no-signal; return whether it locked. No
-/// side-effect writes -- the caller decides what (if anything) to write after lock.
-pub fn wait_lock_t_bare(b: &mut impl Bus) -> bool {
+/// The bit of demod reg 0x80 an ISDB-T lock ignores.
+const T_LOCK_IGNORED: u8 = 0x04;
+
+/// Whether demod reg 0x80 says ISDB-T lock: every bit clear but bit 2. Bits 2 and 1 clear
+/// in either order on the way to 0x00 (0x06 -> 0x04 or 0x02 -> 0x00); 0x04 comes ~0.6 s
+/// after the tune and 0x00 ~0.6 s later, but bit 2 can also stay set for hours: hardware
+/// 2026-11-17, UHF 21ch on both units, C/N 33 dB, while the other channels reached 0x00.
+/// The TS there was free of errors (no TEI, no continuity gap) once the post-lock writes
+/// of [`wait_lock_t`] went out; what bit 2 means is not known. Bit 1 stays a no-lock:
+/// no channel has been seen held at 0x02. Other drivers: m-tsudo's PT3 driver waits for
+/// bit 3 alone (bit 7 gives up), px4_drv for bits 5 and 3 clear and reg 0xB0's low
+/// nibble >= 8; Linux's tc90522 needs bits 7-1 clear (bit 2 included), but takes any of
+/// bits 7-5 of reg 0x96 as lock before it reads 0x80. With 21ch held at 0x04, 0xB0 read
+/// 0xA9 and 0x96 0xC4 / 0xC6, a lock for all three.
+pub fn t_locked(reg80: u8) -> bool {
+    reg80 & !T_LOCK_IGNORED == 0
+}
+
+/// How [`wait_lock_t_bare`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TWait {
+    /// Reg 0x80 said lock ([`t_locked`]).
+    Locked,
+    /// Bit 7 of reg 0x80 stayed set: an empty channel.
+    NoSignal,
+    /// No lock within the wait (a signal that is slow or will not lock), or the firmware
+    /// stopped acking.
+    TimedOut,
+}
+
+/// Poll demod reg 0x80 until lock ([`t_locked`]) or no-signal; return how it ended. No
+/// side-effect writes -- the caller decides what (if anything) to write after it.
+pub fn wait_lock_t_bare(b: &mut impl Bus) -> TWait {
     let t0 = std::time::Instant::now();
     let mut v = 0u8;
     let mut no_signal = 0;
@@ -224,7 +255,7 @@ pub fn wait_lock_t_bare(b: &mut impl Bus) -> bool {
     // up after T_NO_SIGNAL_POLLS: a channel scan meets 40 of them on UHF alone.
     for _ in 0..60 {
         if b.wedged() {
-            return false;
+            return TWait::TimedOut;
         }
         if let Ok(x) = d_read(b, DEMOD_T, 0x80) {
             v = x;
@@ -234,11 +265,14 @@ pub fn wait_lock_t_bare(b: &mut impl Bus) -> bool {
                     "fe1: T no signal (reg0x80=0x{x:02x}) [{} ms]",
                     t0.elapsed().as_millis()
                 );
-                return false;
+                return TWait::NoSignal;
             }
-            if x == 0x00 {
-                info!("fe1: T locked [{} ms]", t0.elapsed().as_millis());
-                return true;
+            if t_locked(x) {
+                info!(
+                    "fe1: T locked (reg0x80=0x{x:02x}) [{} ms]",
+                    t0.elapsed().as_millis()
+                );
+                return TWait::Locked;
             }
         }
         b.sleep_ms(50);
@@ -247,22 +281,75 @@ pub fn wait_lock_t_bare(b: &mut impl Bus) -> bool {
         "fe1: T did not lock (reg0x80=0x{v:02x}) [{} ms]",
         t0.elapsed().as_millis()
     );
-    false
+    TWait::TimedOut
 }
 
+/// Lock polls after the post-lock writes for a lock that went away to come back (~1 s).
+const T_RELOCK_POLLS: u32 = 20;
+
+/// Wait for ISDB-T lock, then write the stock post-lock registers, which the demod needs
+/// before it puts any TS out.
+///
+/// They are written after a wait that timed out on a signal too: a caller that reads
+/// the status on (the System1 start of `dt295 serve`, the CLI's lock wait) can see a
+/// lock that came late, and its TS then flows. Written before lock they do not change
+/// the lock: hardware 2026-11-17, written ~0.17 s into the wait (reg 0x80 still 0x2F),
+/// four channels locked at the usual 0.6-1.1 s with their whole TS. An empty channel is
+/// left as it is (a scan meets ~40 of them).
+///
+/// After the writes a lock must still hold, or come back within ~1 s: the BonDriver and
+/// the raw-TS path read the status once, right after the tune, and a weak signal taken
+/// at 0x04 could fall back to 0x06 for a moment. On the channels seen so far (C/N
+/// 32-34 dB) reg 0x80 never went back.
 pub fn wait_lock_t(b: &mut impl Bus) {
-    if wait_lock_t_bare(b) {
-        // Stock post-lock writes (the vendor's settle after an ISDB-T lock).
-        b.sleep_ms(120);
-        let _ = d_write(b, DEMOD_T, 0x1D, 0x02);
-        let _ = d_write(b, DEMOD_T, 0x1E, 0x2A);
-        let _ = d_write(b, DEMOD_T, 0x1F, 0x8A);
-        for r in [0x77, 0x76, 0x5C] {
-            if let Ok(rr) = d_read(b, DEMOD_T, r) {
-                let _ = d_write(b, DEMOD_T, r, rr);
-            }
+    let end = wait_lock_t_bare(b);
+    if end == TWait::NoSignal || b.wedged() {
+        return;
+    }
+    // Stock post-lock writes (the vendor's settle after an ISDB-T lock). The demod puts
+    // no TS out before them: hardware 2026-11-17, a channel held at 0x80 = 0x04 gave none
+    // until they were written, then its whole TS.
+    b.sleep_ms(120);
+    let _ = d_write(b, DEMOD_T, 0x1D, 0x02);
+    let _ = d_write(b, DEMOD_T, 0x1E, 0x2A);
+    let _ = d_write(b, DEMOD_T, 0x1F, 0x8A);
+    for r in [0x77, 0x76, 0x5C] {
+        if let Ok(rr) = d_read(b, DEMOD_T, r) {
+            let _ = d_write(b, DEMOD_T, r, rr);
         }
     }
+    if end == TWait::Locked {
+        hold_lock_t(b);
+    }
+}
+
+/// After the post-lock writes: return once reg 0x80 says lock, polling up to
+/// [`T_RELOCK_POLLS`] times if it does not (logged then).
+fn hold_lock_t(b: &mut impl Bus) {
+    let t0 = std::time::Instant::now();
+    let mut v = 0u8;
+    for i in 0..T_RELOCK_POLLS {
+        if b.wedged() {
+            return;
+        }
+        if let Ok(x) = d_read(b, DEMOD_T, 0x80) {
+            if t_locked(x) {
+                if i > 0 {
+                    info!(
+                        "fe1: T lock back after the post-lock writes (reg0x80=0x{x:02x}) [{} ms]",
+                        t0.elapsed().as_millis()
+                    );
+                }
+                return;
+            }
+            v = x;
+        }
+        b.sleep_ms(50);
+    }
+    warn!(
+        "fe1: T lock lost after the post-lock writes (reg0x80=0x{v:02x}) [{} ms]",
+        t0.elapsed().as_millis()
+    );
 }
 
 /// The forward (pre-lock) part of an ISDB-T tune: park S, wake T, write the PRE block,
@@ -325,7 +412,8 @@ fn tune_t_forward(b: &mut impl Bus, freq_hz: u32) {
 
 /// Tune ISDB-T (`freq_hz` = the channel centre) and wait for lock (a missing lock is
 /// logged, not an error: the caller reads the status). The stock path: 0x1D/0x1E/0x1F
-/// = 02/2A/8A are written AFTER lock (in [`wait_lock_t`]).
+/// = 02/2A/8A are written AFTER lock, or at the end of a wait that timed out (in
+/// [`wait_lock_t`]).
 pub fn tune_t(b: &mut impl Bus, freq_hz: u32) -> Result<()> {
     tune_t_forward(b, freq_hz);
     not_wedged(b)?;
@@ -339,8 +427,8 @@ pub fn read_t(b: &mut impl Bus, reg: u8) -> u8 {
     d_read(b, DEMOD_T, reg).unwrap_or(0xee)
 }
 
-/// Read an ISDB-S demod register (slave DEMOD_S); `0xff` if the read fails. Reg 0xC3 == 0x00
-/// = locked (same convention as [`read_status`] / `wait_lock_s`).
+/// Read an ISDB-S demod register (slave DEMOD_S); `0xff` if the read fails. Reg 0xC3: lock
+/// as [`s_locked`] reads it.
 pub fn read_s(b: &mut impl Bus, reg: u8) -> u8 {
     d_read(b, DEMOD_S, reg).unwrap_or(0xff)
 }
@@ -349,7 +437,7 @@ pub fn read_s(b: &mut impl Bus, reg: u8) -> u8 {
 //
 // The captured vendor satellite I2C sequence, replayed with four substitutions:
 //   freq (FE C0 00 ..): round(IF_MHz / 0.5), from freq_hz
-//   band (FE C0 09 ..): 0x8C for BS, 0x44 for CS
+//   band (FE C0 09 ..): by frequency (sat_band_reg)
 //   reg 0x8F / 0x90:    the broadcast TSID, high / low byte
 // freq_hz is the L-band IF (as the ini supplies it); 0x8F / 0x90 are the TC90522
 // TS-select registers (Linux tc90522s_set_tsid writes them the same way). The capture
@@ -400,6 +488,15 @@ const TUNE_S_SEQ: &[SOp] = &[
     s(0x22, 1, &[0xa3]), s(0x22, 0, &[0xa3, 0x80]),
 ];
 
+/// Whether demod reg 0xC3 says ISDB-S lock: bits 7-4 clear. Linux's tc90522 reads bit 7
+/// as the input level, bits 6-5 as the carrier and bit 4 as the lock, and wants reg 0xC5
+/// bits 1-0 too (not read here); px4_drv looks at bit 4 alone. Bits 3-0 are no lock bits:
+/// PT3's driver reads bit 2 as the TMCC's emergency-alarm flag and bit 1 as its extension
+/// flag, so a test for 0xC3 == 0x00 took a TS with either flag set for one without lock.
+pub fn s_locked(c3: u8) -> bool {
+    c3 & 0xF0 == 0
+}
+
 fn wait_lock_s(b: &mut impl Bus) -> bool {
     let mut v = 0xFFu8;
     for _ in 0..20 {
@@ -409,8 +506,8 @@ fn wait_lock_s(b: &mut impl Bus) -> bool {
         }
         if let Ok(x) = d_read(b, DEMOD_S, 0xC3) {
             v = x;
-            if x == 0x00 {
-                info!("fe1: S locked");
+            if s_locked(x) {
+                info!("fe1: S locked (0xC3={x:02x})");
                 return true;
             }
         }
@@ -474,16 +571,40 @@ fn check_ts_s(b: &mut impl Bus, tsid: u16) -> Option<u16> {
     got
 }
 
+/// Tuner reg 0x09 for the IF `f_hz`: the HORUS3A's G_CTL (bits 7-5) and F_CTL (bits 4-0)
+/// by frequency, the table of Linux's horus3a.c, which rounds the frequency to MHz first.
+/// The BS / CS values used before, 0x8C and 0x44, are this table's at BS-15's 1318 MHz
+/// and below 1800 MHz: the CS transponders from ND12 (1813 MHz) and most BS ones got the
+/// value of another band.
+fn sat_band_reg(f_hz: u32) -> u8 {
+    // (below this many MHz, F_CTL, G_CTL)
+    const BANDS: [(u32, u8, u8); 9] = [
+        (975, 0x1C, 1),
+        (1050, 0x18, 2),
+        (1150, 0x14, 2),
+        (1250, 0x10, 3),
+        (1350, 0x0C, 4),
+        (1450, 0x0A, 4),
+        (1600, 0x07, 5),
+        (1800, 0x04, 2),
+        (2000, 0x02, 1),
+    ];
+    let mhz = (f_hz + 500_000) / 1_000_000;
+    let (f_ctl, g_ctl) = BANDS
+        .iter()
+        .find(|&&(below, ..)| mhz < below)
+        .map_or((0x00, 0), |&(_, f, g)| (f, g));
+    (g_ctl << 5) | f_ctl
+}
+
 /// Tune ISDB-S (`freq_hz` = IF, `tsid` = the wanted TS) and wait for lock. Returns the
 /// TSID the demod streams, when it could be read.
 pub fn tune_s(b: &mut impl Bus, freq_hz: u32, tsid: u16) -> Result<Option<u16>> {
     let v = ((u64::from(freq_hz) + 250_000) / 500_000) as u32; // round(IF_MHz / 0.5)
     let [r8f, r90] = tsid.to_be_bytes();
-    // CS110 TSIDs are 0x6xxx / 0x7xxx (BS: 0x4xxx); an older `r8f == 0x60` test
-    // treated e.g. ND4 = 0x7040 as BS.
-    let band = if (tsid >> 12) >= 0x6 { 0x44 } else { 0x8C };
+    let band = sat_band_reg(freq_hz);
     info!(
-        "fe1: tune S {:.3} MHz tsid={tsid:04x} (freq={:04x} 8f={r8f:02x} 90={r90:02x})",
+        "fe1: tune S {:.3} MHz tsid={tsid:04x} (freq={:04x} 09={band:02x} 8f={r8f:02x} 90={r90:02x})",
         f64::from(freq_hz) / 1e6,
         v & 0xFFFF
     );
@@ -527,7 +648,7 @@ pub fn tune_s(b: &mut impl Bus, freq_hz: u32, tsid: u16) -> Result<Option<u16>> 
 }
 
 /// ISDB-S demod sample, the registers the vendor driver polls while streaming (as
-/// provided by a third party): lock 0xC3 (0 = locked), C/N 0xBC (2 B) and the two 3-byte error
+/// provided by a third party): lock 0xC3 ([`s_locked`]), C/N 0xBC (2 B) and the two 3-byte error
 /// counters 0xEB and 0xF0 ("mostly 0, now and then non-zero"). (lock, cn_raw, eb, f0).
 pub fn sample_s(b: &mut impl Bus) -> Result<(u8, u32, u32, u32)> {
     let lock = d_read(b, DEMOD_S, 0xC3)?;
@@ -541,7 +662,7 @@ pub fn sample_s(b: &mut impl Bus) -> Result<(u8, u32, u32, u32)> {
     Ok((lock, cn, eb, f0))
 }
 
-/// ISDB-T demod sample for the live signal level: lock 0x80 (0 = locked) and the 3-byte
+/// ISDB-T demod sample for the live signal level: lock 0x80 ([`t_locked`]) and the 3-byte
 /// C/N at 0x8B. (lock, cn_raw).
 pub fn sample_t(b: &mut impl Bus) -> Result<(u8, u32)> {
     let lock = d_read(b, DEMOD_T, 0x80)?;
@@ -560,8 +681,8 @@ fn be24(x: [u8; 3]) -> u32 {
 pub fn read_status(b: &mut impl Bus, sys: System) -> Result<Status> {
     let mut st = Status {
         locked: match sys {
-            System::Terrestrial => d_read(b, DEMOD_T, 0x80).unwrap_or(0xFF) == 0x00,
-            System::Satellite => d_read(b, DEMOD_S, 0xC3).unwrap_or(0xFF) == 0x00,
+            System::Terrestrial => t_locked(d_read(b, DEMOD_T, 0x80).unwrap_or(0xFF)),
+            System::Satellite => s_locked(d_read(b, DEMOD_S, 0xC3).unwrap_or(0xFF)),
         },
         ..Status::default()
     };
@@ -659,7 +780,8 @@ mod tests {
     const TUNE_T_TAIL: &str = " W20=fec00001 W20=fec03181 W20=fec00000 W20=fec07c1f W20=fec01200 \
         W20=fec0fb6e R20=fec1/1 W20=fec06e81 W20=fec0fb14 R20=fec1/1 W20=fec01413 W20=fec01201 \
         W20=fec0fb6e R20=fec1/1 W20=fec06e01 R20=0e/1 W20=0e71 W20=0f10 W20=0140 W20=234c R20=80/1 \
-        S120 W20=1d02 W20=1e2a W20=1f8a R20=77/1 W20=775a R20=76/1 W20=765a R20=5c/1 W20=5c5a";
+        S120 W20=1d02 W20=1e2a W20=1f8a R20=77/1 W20=775a R20=76/1 W20=765a R20=5c/1 W20=5c5a \
+        R20=80/1";
     const TUNE_S_1318_40F1: &str = " W20=2500 S3 W20=234d S3 W20=0390 S3 W20=fec01200 S3 \
         W20=fec00b00 S3 R22=1e/1 S3 W22=1e28 S3 W22=fec01100a7 S3 W22=fec02ab9 S80 W22=fec01cc0 \
         S80 W22=fec02971 S80 W22=1700 S3 W22=1e20 S3 W22=0aff S3 W22=0301 S3 W22=1caa S3 W22=1f2a \
@@ -719,8 +841,8 @@ mod tests {
         assert_eq!(terr_band_regs(699_999_999), (0x81, 0x1F));
     }
 
-    /// Demod reg 0x80 reads follow `script` (its last value repeats); the I2C log keeps
-    /// the writes.
+    /// Demod reg 0x80 (T) and 0xC3 (S) reads follow `script` (its last value repeats); the
+    /// I2C log keeps the writes.
     struct Lock {
         script: Vec<u8>,
         polls: usize,
@@ -734,7 +856,7 @@ mod tests {
         }
         fn i2c_write_read(&mut self, slave: u8, w: &[u8], r: &mut [u8]) -> Result<()> {
             r.fill(0x5A);
-            if slave == DEMOD_T && w == [0x80] {
+            if (slave == DEMOD_T && w == [0x80]) || (slave == DEMOD_S && w == [0xC3]) {
                 r[0] = self.script[self.polls.min(self.script.len() - 1)];
                 self.polls += 1;
             }
@@ -743,7 +865,8 @@ mod tests {
         fn sleep_ms(&mut self, _ms: u64) {}
     }
 
-    /// (lock polls, locked) of `wait_lock_t` on the reg 0x80 values `script`.
+    /// (lock polls, whether the post-lock writes went out) of `wait_lock_t` on the reg 0x80
+    /// values `script`.
     fn wait_t(script: &[u8]) -> (usize, bool) {
         let mut b = Lock {
             script: script.to_vec(),
@@ -766,13 +889,104 @@ mod tests {
 
     #[test]
     fn t_lock_wait_keeps_a_present_signal() {
-        // the hardware's present channel: no bit 7, locks after ~1 s
+        // a present channel (2026-10-19): no bit 7, bit 2 clears first, locks at 0x00
         let s = [
             0x2f, 0x2f, 0x2f, 0x2f, 0x2f, 0x2f, 0x2e, 0x0e, 0x06, 0x06, 0x02, 0x00,
         ];
-        assert_eq!(wait_t(&s), (12, true));
-        // a signal that does not lock waits the whole ~3.4 s
-        assert_eq!(wait_t(&[0x2f, 0x06]), (60, false));
+        // (+1: the read after the post-lock writes)
+        assert_eq!(wait_t(&s), (12 + 1, true));
+        // bit 1 clears first (2026-11-17): lock at 0x04, also for a channel held there
+        assert_eq!(wait_t(&[0x2f, 0x2e, 0x0e, 0x06, 0x04, 0x00]), (5 + 1, true));
+        assert_eq!(wait_t(&[0x2f, 0x2e, 0x0e, 0x04]), (4 + 1, true));
+        // a signal that does not lock waits the whole ~3.4 s, then gets the writes for a
+        // lock that comes later
+        assert_eq!(wait_t(&[0x2f, 0x06]), (60, true));
+    }
+
+    #[test]
+    fn t_lock_must_hold_after_the_post_lock_writes() {
+        // back from 0x06 on the third poll after the writes
+        assert_eq!(wait_t(&[0x2f, 0x04, 0x06, 0x06, 0x04]), (2 + 3, true));
+        // gone for good: ~1 s more, then the caller's status read says no lock
+        assert_eq!(
+            wait_t(&[0x2f, 0x04, 0x06]),
+            (2 + T_RELOCK_POLLS as usize, true)
+        );
+    }
+
+    #[test]
+    fn t_lock_ignores_bit_2_only() {
+        for x in [0x00, 0x04] {
+            assert!(t_locked(x), "0x{x:02x}");
+        }
+        for x in [0x01, 0x02, 0x06, 0x08, 0x0e, 0x2e, 0x2f, 0x84, 0xaf] {
+            assert!(!t_locked(x), "0x{x:02x}");
+        }
+        let mut b = Lock {
+            script: vec![0x04],
+            polls: 0,
+            writes: String::new(),
+        };
+        assert!(read_status(&mut b, System::Terrestrial).unwrap().locked);
+        b.script = vec![0x06];
+        assert!(!read_status(&mut b, System::Terrestrial).unwrap().locked);
+    }
+
+    #[test]
+    fn s_lock_ignores_bits_3_0() {
+        for x in [0x00, 0x01, 0x02, 0x04, 0x0f] {
+            assert!(s_locked(x), "0x{x:02x}");
+        }
+        for x in [0x10, 0x14, 0x20, 0x40, 0x80, 0xff] {
+            assert!(!s_locked(x), "0x{x:02x}");
+        }
+        let mut b = Lock {
+            script: vec![0x10, 0x04],
+            polls: 0,
+            writes: String::new(),
+        };
+        assert!(wait_lock_s(&mut b));
+        assert_eq!(b.polls, 2);
+        assert!(read_status(&mut b, System::Satellite).unwrap().locked);
+        b.script = vec![0x14];
+        assert!(!read_status(&mut b, System::Satellite).unwrap().locked);
+    }
+
+    #[test]
+    fn sat_band_follows_the_frequency() {
+        // the IFs of BS-1 .. BS-23 and some CS110 NDs, against Linux's horus3a.c table
+        for (khz, want) in [
+            (1_049_480, 0x58),
+            (1_087_840, 0x54),
+            (1_126_200, 0x54),
+            (1_164_560, 0x70),
+            (1_241_280, 0x70),
+            (1_279_640, 0x8C),
+            (1_318_000, 0x8C),
+            (1_356_360, 0x8A),
+            (1_433_080, 0x8A),
+            (1_471_440, 0xA7),
+            (1_613_000, 0x44),
+            (1_773_000, 0x44),
+            (1_813_000, 0x22),
+            (1_973_000, 0x22),
+            (2_013_000, 0x00),
+            (2_053_000, 0x00),
+        ] {
+            assert_eq!(sat_band_reg(khz * 1000), want, "{khz} kHz");
+        }
+        // rounded to MHz first, as Linux does
+        assert_eq!(sat_band_reg(1_799_500_000), 0x22);
+        assert_eq!(sat_band_reg(1_799_499_999), 0x44);
+        // the TSID plays no part: a BS tune without one gets the BS value
+        let got = rec(|b| {
+            tune_s(b, 1_318_000_000, crate::chan::NO_TSID).unwrap();
+        });
+        assert!(got.contains(" W22=fec0098c "), "{got}");
+        let got = rec(|b| {
+            tune_s(b, 1_853_000_000, 0x70E0).unwrap();
+        });
+        assert!(got.contains(" W22=fec00922 "), "{got}");
     }
 
     #[test]

@@ -220,6 +220,8 @@ jobs:
           install -m 755 "$bin" "$stage/"
           install -m 644 README.md INSTALL.md LICENSE docs/usage.md "$stage/"
           cp -r packaging/linux packaging/examples "$stage/packaging/"
+          # executable whatever the snapshot's tree says (v0.2.0 and v0.3.0 had it 100644)
+          chmod 755 "$stage/packaging/examples/dt295-logos"
           # The same bytes from the same commit: the time of the commit, no owners.
           mtime=$(git log -1 --format=%ct)
           tar --sort=name --mtime="@$mtime" --owner=0 --group=0 --numeric-owner -C stage -cf - "$NAME" \
