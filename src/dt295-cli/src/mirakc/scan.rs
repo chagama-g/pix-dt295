@@ -25,11 +25,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use anyhow::{Context, Result, bail};
-use dt295::chan;
+use dt295::chan::{self, transponder};
 
 use super::Channel;
 use super::psi::{Psi, Table};
-use crate::lineup::transponder;
 #[cfg(unix)]
 use crate::serve::proto::{Reply, Request, Tuning};
 
@@ -37,12 +36,12 @@ use crate::serve::proto::{Reply, Request, Tuning};
 /// not data, temporary or promo services, nor 4K, which the device cannot output).
 const LISTED_TYPES: [u8; 2] = [0x01, 0x02];
 
-/// A known TS of each satellite network to start from: (label, network, IF in Hz,
-/// transport_stream_id).
-const SEEDS: [(&str, u16, u32, u16); 3] = [
-    ("BS", 4, 1_318_000_000, 0x40F1),
-    ("CS110 network 6", 6, 1_613_000_000, 0x6020),
-    ("CS110 network 7", 7, 1_653_000_000, 0x7040),
+/// A known TS of each satellite network to start from: (label, network,
+/// transport_stream_id); the frequency is its transponder's ([`transponder`]).
+const SEEDS: [(&str, u16, u16); 3] = [
+    ("BS", 4, 0x40F1),
+    ("CS110 network 6", 6, 0x6020),
+    ("CS110 network 7", 7, 0x7040),
 ];
 
 /// The terrestrial channels to try: (label, mirakc channel, frequency in Hz).
@@ -217,7 +216,8 @@ pub(super) fn run(
         t0.elapsed().as_secs_f64()
     );
 
-    for (label, onid, hz, tsid) in SEEDS {
+    for (label, onid, tsid) in SEEDS {
+        let hz = transponder(onid, tsid).map_or_default(|t| t.if_khz * 1000);
         let t1 = Instant::now();
         let mut tables = Vec::new();
         let tuning = Tuning::Satellite { hz, tsid };
@@ -341,6 +341,22 @@ fn tune(
 mod tests {
     use super::super::psi::tests::{Ts, pat, sdt};
     use super::*;
+
+    #[test]
+    fn seeds_are_receivable_transponders() {
+        let hz: Vec<_> = SEEDS
+            .iter()
+            .map(|&(_, onid, tsid)| transponder(onid, tsid).map(|t| t.if_khz * 1000))
+            .collect();
+        assert_eq!(
+            hz,
+            [
+                Some(1_318_000_000),
+                Some(1_613_000_000),
+                Some(1_653_000_000)
+            ]
+        );
+    }
 
     #[test]
     fn terrestrial_takes_every_tv_service() {

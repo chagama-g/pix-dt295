@@ -201,7 +201,7 @@ jobs:
       - name: Test
         if: matrix.test
         # the crates the Arch package tests (packaging/arch/PKGBUILD)
-        run: cargo test --locked --target "$TARGET" -p dt295-usb -p dt295 -p dt295-cli
+        run: cargo test --locked --target "$TARGET" -p dt295-usb -p dt295-chdef -p dt295 -p dt295-cli
 
       - name: Build
         run: cargo build --locked --release --target "$TARGET" -p dt295-cli

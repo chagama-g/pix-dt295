@@ -16,6 +16,7 @@
 | crate | 種類 | 内容 |
 |---|---|---|
 | `src/dt295-usb` | lib | USB アクセス。Windows は windows-sys で WinUSB を直接、Linux は nusb |
+| `src/dt295-chdef` | lib | デバイスに依存しないチャンネル定義。設定ファイルの文字コード, Win32 のプロファイル API と同じ ini の読み方, C の数値の書式, 地デジと BS / CS110 の周波数の表 |
 | `src/dt295-core` | lib | ハードウェアの土台。レジスターとコマンドのプロトコル, I2C, フロントエンド (選局, ロック待ち, C/N), チャンネル表, ファームウェアの転送, 共有する型 (`System` / `Status` / `TsSink`) |
 | `src/dt295-rawfw` | lib | 自前コードのみの raw-TS 経路 ([raw-ts.md](raw-ts.md))。cold stream の worker, FR monitor のホスト側, ホスト面の demod I2C。`dt295-core` の上に乗る |
 | `src/dt295-frmon` | lib | 自前の boot0 monitor (FR CPU) と、必要な FR 命令の小さな assembler (オンチップのコードのビルドと確認に使う) |
@@ -27,17 +28,20 @@
 |---|---|
 | `dt295-usb/src/` | 制御, バルク, 割り込み転送, EP 0x81 の読み出しキュー `ReadQueue`, 個体の一覧 |
 | `dt295-core/src/{proto,fwdl}.rs` | レジスター, doorbell, コマンドと ACK 待ち, ファームウェアの転送 |
-| `dt295-core/src/{i2c,fe1,signal,chan}.rs` | I2C, フロントエンド (選局, ロック待ち, C/N), 地デジのチャンネル表と衛星の ini の行 (BonDriver と `dt295` が共有) |
+| `dt295-core/src/{i2c,fe1,signal}.rs` | I2C, フロントエンド (選局, ロック待ち, C/N) |
+| `dt295-chdef/src/{text,profile,num,plan}.rs` | 設定ファイルの文字コード, Win32 のプロファイル API と同じ ini の読み方, C の数値の書式, 地デジのチャンネル表と BS / CS110 の周波数の表 (BonDriver と `dt295` が共有) |
+| `dt295-chdef/src/{bda,chset,px}.rs` | ほかの BonDriver のチャンネル定義ファイル (`[Tuner] ChannelFile`): BonDriver_BDA の ini, PT の ChSet.txt, BonDriver_PX シリーズの ini を、そのドライバーと同じ読み方と番号の振り方で読む |
+| `dt295-core/src/{chan,bonini}.rs` | TSID からのトランスポンダー, 衛星の ini の行, ini のチューニング空間, ini の `[Tuner]` (ファームウェア, 個体, 状態ファイル, raw-TS) |
 | `dt295-rawfw/src/` | 自前コードのみの raw-TS 経路 ([raw-ts.md](raw-ts.md))。`rawstream` が cold stream の worker, `frmon_host` が FR monitor のホスト側, `fjcore` がホスト面の demod I2C と cold 立ち上げ |
 | `dt295-frmon/src/` | 自前の boot0 monitor (FR CPU) と FR 命令の小さな assembler |
 | `dt295/src/{device,fw}.rs` | 公開 API `Device`, ファームウェアの起動と残った状態からの回復, ほかのスレッド向けの `Live` (ストリーム中の C/N など) |
 | `dt295/src/{auth,cas,dtvdec}.rs` | 起動時の認証, セキュアセッション (keepalive, B-CAS の第 2 段), リンク鍵 |
 | `dt295/src/s1/` | System1 ストリームと worker (下の "仕組み" セクション)。`decoder_init.bin` は純正の初期化のキャプチャで、手で編集しない |
 | `dt295/src/ts/` | I/O の無い TS 処理 (PAT, PMT, セクションの組み立て, リンク暗号, PSI keeper, 全サービスのルート `route.rs` など)。単体テストの大半はここ |
-| `dt295/src/{state,watch}.rs` | 状態ファイル, ストリームを始め直すかの判断 (`CardWatch`: B-CAS カードと止まったファームウェア、後者のみなら `StallWatch`) |
+| `dt295/src/{state,watch}.rs` | 状態ファイルと、リンク鍵と PSI のキャッシュの扱いの規則 (BonDriver と `dt295` が共有), ストリームを始め直すかの判断 (`CardWatch`: B-CAS カードと止まったファームウェア、後者のみなら `StallWatch`) |
 | `dt295-bondriver/src/{ffi,driver}.rs`, `cpp/` | `CreateBonDriver` と shim。`IBonDriver2` の中身 (選局, ストリーム, idle keeper, 回復)。raw-TS 経路の選局とストリームも `driver.rs` ([raw-ts.md](raw-ts.md)) |
-| `dt295-bondriver/src/{config,channels,persist,fifo,logging}.rs` | ini, チューニング空間, 状態ファイルの規則, TS の FIFO, ログ |
-| `dt295-cli/src/` | サブコマンドごとのファイル。`tuner.rs` は `capture`, `logo`, `serve` が共有する個体の起動と停止の合図, `bonini.rs`, `ch2.rs`, `sections.rs` は ini, .ch2, TS のパケットの読み取り |
+| `dt295-bondriver/src/{config,persist,fifo,logging}.rs` | ini の読み込み (ログの設定と DLL の名前から決まるパス), 状態ファイルの規則, TS の FIFO, ログ |
+| `dt295-cli/src/` | サブコマンドごとのファイル。`tuner.rs` は `capture`, `logo`, `serve` が共有する個体の起動と停止の合図, `rawts.rs` は `capture` と `serve` が共有する raw-TS の開始と最初の TS の待ち, `bonini.rs`, `ch2.rs`, `sections.rs` は ini, .ch2, TS のパケットの読み取り |
 | `dt295-cli/src/serve/`, `tune.rs` | `dt295 serve` と `dt295 tune`。`conf` と `proto` はどの OS でもビルドしてテスト |
 | `packaging/arch/` | Arch Linux のパッケージ (PKGBUILD と makepkg の install スクリプト) |
 | `packaging/linux/` | パッケージが共有する systemd のユニット, sysusers, tmpfiles, udev のルール |

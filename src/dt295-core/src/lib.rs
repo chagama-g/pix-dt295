@@ -2,13 +2,15 @@
 //!
 //! This crate holds the low-level pieces the rest of the driver builds on: the
 //! register / command protocol over USB ([`proto`]), the type-9 I2C transport
-//! ([`i2c`]), the System1 front end ([`fe1`]), the channel tables ([`chan`]), the
-//! C/N conversions ([`signal`]), the firmware download helpers ([`fwdl`]), the
-//! driver error type ([`error`]), and the shared [`System`] / [`Status`] / [`TsSink`]
-//! types.
+//! ([`i2c`]), the System1 front end ([`fe1`]), the channel tables and tuning spaces
+//! ([`chan`]), the ini rules of the Win32 profile API ([`profile`], from `dt295-chdef`)
+//! and the BonDriver ini's `[Tuner]` ([`bonini`]), the C/N conversions ([`signal`]), the firmware
+//! download helpers ([`fwdl`]), the driver error type ([`error`]), and the shared
+//! [`System`] / [`Status`] / [`TsSink`] types.
 //!
 //! Logging uses `tracing`; the host installs the subscriber.
 
+pub mod bonini;
 pub mod chan;
 pub mod error;
 pub mod fe1;
@@ -17,6 +19,7 @@ pub mod i2c;
 pub mod proto;
 pub mod signal;
 
+pub use dt295_chdef::profile;
 pub use error::{Error, Result};
 
 /// The TS bulk endpoint (EP 0x81) of the System1 and raw-TS data paths.

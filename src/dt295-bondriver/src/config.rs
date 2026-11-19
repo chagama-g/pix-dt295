@@ -1,20 +1,20 @@
-//! `BonDriver_DT295.ini` (next to the DLL, same base name), read with `rust-ini` under
-//! the Win32 profile API's rules (`GetPrivateProfileStringW` and friends).
+//! `BonDriver_DT295.ini` (next to the DLL, same base name), read under the Win32
+//! profile API's rules ([`dt295::profile`]).
 //!
-//! `[Tuner]`: `Firmware`, `TrcFirmware`, `DeviceIndex`, `LogFile`, `LogLevel`,
-//! `StateFile`, `UHF`, `CATV`. `[BS]` / `[CS110]`: one `name=IF_kHz,TSID[,ServiceID]` line per channel.
-//! Section and key names are case-insensitive; backslashes are literal (escapes off).
+//! `[Tuner]`: `Firmware`, `TrcFirmware`, `DeviceIndex`, `DeviceSerial`, `StateFile`,
+//! `RawTS`, `ChannelFile` ([`dt295::bonini::Tuner`]), `LogFile`, `LogLevel`, `UHF`,
+//! `CATV`. `[BS]` / `[CS110]`: one `name=IF_kHz,TSID[,ServiceID]` line per channel. The
+//! `[Tuner]` keys of the unit and the tuning spaces ([`dt295::chan::ini_spaces`]: the
+//! ini's own, or those of the `ChannelFile`) are read by the shared code the `dt295`
+//! command reads the same file with.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use ini::{Ini, ParseOption};
+use dt295::bonini::{DeviceSel, Tuner};
+use dt295::chan::{self, Space};
+use dt295::profile::{self, Ini};
 use tracing::level_filters::LevelFilter;
-
-use crate::channels::{Space, catv_space, satellite_channel, uhf_space};
-
-const DEFAULT_FIRMWARE: &str = "mb86m01_assp_osec_idle.bin";
-const DEFAULT_TRC_FIRMWARE: &str = "mb86m01_assp_osec_trc_m_h.bin";
 
 /// Paths derived from the DLL's own file name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -65,27 +65,6 @@ impl ModulePaths {
         s.push(ext);
         PathBuf::from(s)
     }
-
-    /// An ini path: absolute (`X:...` or `\\...`) as is, else appended to the DLL
-    /// folder (plain string concatenation).
-    pub fn resolve(&self, value: &str) -> PathBuf {
-        if is_absolute(value) {
-            PathBuf::from(value)
-        } else {
-            let mut s = self.dir.clone();
-            s.push(value);
-            PathBuf::from(s)
-        }
-    }
-}
-
-/// A drive letter path or a UNC path.
-fn is_absolute(p: &str) -> bool {
-    let mut c = p.chars();
-    matches!(
-        (c.next(), c.next()),
-        (Some(_), Some(':')) | (Some('\\'), Some('\\'))
-    )
 }
 
 /// What `LoadConfig` reads.
@@ -112,8 +91,12 @@ pub struct Config {
     /// read in raw-TS mode to prime on a known on-air channel at the very first open. Always
     /// `Some` from an ini; `None` only for a driver that must not touch the disk (tests).
     pub ch2_file: Option<PathBuf>,
-    /// UHF, CATV (unless hidden), then BS and CS110 when they have lines.
+    /// UHF, CATV (unless hidden), then BS and CS110 when they have lines; or the spaces of
+    /// the `[Tuner] ChannelFile` (none when it cannot be read).
     pub spaces: Vec<Space>,
+    /// What to log about the `ChannelFile` once the log is open: `Ok` lines (its format
+    /// and spaces), or `Err` why it could not be read.
+    pub channel_file_log: Result<Vec<String>, String>,
     /// `[Tuner] RawTS`: non-zero = the blob-free raw-TS path -- the host brings the chip up,
     /// tunes over the host-face I2C, arms the capture engine and runs its own TS pump (no
     /// resident, no aux core, no vendor firmware), streaming the scrambled TS for the PC-side
@@ -125,20 +108,11 @@ pub struct Config {
 impl Config {
     /// Read the configuration from a parsed ini (an empty one gives the defaults).
     pub fn from_ini(ini: &Ini, paths: &ModulePaths) -> Self {
-        let firmware = paths.resolve(tuner_string(ini, "Firmware").unwrap_or(DEFAULT_FIRMWARE));
-
-        // System1 (EP 0x81) transcoder firmware: the vendor viewing path, and the only
-        // one the Rust port has (empty = streams cannot start).
-        let trc = tuner_string(ini, "TrcFirmware").unwrap_or(DEFAULT_TRC_FIRMWARE);
-        let trc_firmware = (!trc.is_empty()).then(|| paths.resolve(trc));
-
-        let index = tuner_int(ini, "DeviceIndex", 0) as i32; // truncated to 32 bits
-        let serial = tuner_string(ini, "DeviceSerial").unwrap_or("").trim();
-        let device = if serial.is_empty() {
-            DeviceSel::Index(usize::try_from(index).unwrap_or(usize::MAX))
-        } else {
-            DeviceSel::Serial(serial.to_ascii_uppercase())
-        };
+        // The firmware, the unit, the state file and RawTS: the dt295 command reads them
+        // from the same file with the same code. The state file cannot be turned off:
+        // without it a re-open loses the link key (no picture until a re-plug), every tune
+        // rediscovers its service, and uncontracted pay channels drop out of scans.
+        let tuner = Tuner::from_ini(ini, Path::new(&paths.dir), Path::new(&paths.stem));
 
         // LogFile=1: the core log to <dll>.log, a fixed name -- one per DLL copy, and TVTest
         // needs a copy of the DLL and ini per unit. Absent or 0 = no file.
@@ -148,208 +122,53 @@ impl Config {
             v => v.parse::<LevelFilter>().map_err(|_| v.to_owned()),
         };
 
-        // The state file cannot be turned off: without it a re-open loses the link key
-        // (no picture until a re-plug), every tune rediscovers its service, and
-        // uncontracted pay channels drop out of scans. Absent or empty = <dll>.state; a
-        // value = that file (relative to the DLL folder), e.g. one shared by two DLLs that
-        // open the same unit.
-        let state_file = Some(match tuner_string(ini, "StateFile").unwrap_or("") {
-            "" => paths.sibling(".state"),
-            p => paths.resolve(p),
-        });
         // TVTest writes <dll>.ch2 next to the DLL, not next to a relocated StateFile, so derive
         // it from the module path (the same sibling the log and the default state use).
         let ch2_file = Some(paths.sibling(".ch2"));
 
-        let mut spaces = Vec::new();
-        if tuner_int(ini, "UHF", 1) != 0 {
-            spaces.push(uhf_space());
-        }
-        if tuner_int(ini, "CATV", 1) != 0 {
-            spaces.push(catv_space());
-        }
-        spaces.extend(satellite_space(ini, "BS"));
-        spaces.extend(satellite_space(ini, "CS110"));
-
-        // RawTS=1 selects the blob-free raw-TS path (host-side, PC B-CAS); else System1.
-        let raw_ts = tuner_int(ini, "RawTS", 0) != 0;
+        // A ChannelFile that cannot be read lists no spaces: the ini's own would number
+        // the channels unlike the .ch2 made with that file.
+        let (spaces, channel_file_log) = match chan::ini_spaces(ini, tuner.channel_file.as_deref())
+        {
+            Ok((spaces, log)) => (spaces, Ok(log)),
+            Err(e) => (Vec::new(), Err(e)),
+        };
 
         Self {
-            firmware,
-            trc_firmware,
-            device,
+            firmware: tuner.firmware,
+            trc_firmware: tuner.trc_firmware,
+            device: tuner.device,
             log_file,
             log_level,
-            state_file,
+            state_file: Some(tuner.state_file),
             ch2_file,
             spaces,
-            raw_ts,
+            channel_file_log,
+            raw_ts: tuner.raw_ts,
         }
     }
 }
 
-/// Which device a DLL opens.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeviceSel {
-    /// `[Tuner] DeviceIndex`: the n-th PIX-DT295 this process can open (one in use by
-    /// another host is skipped, so with several units the numbers shift).
-    Index(usize),
-    /// `[Tuner] DeviceSerial`: the unit with this USB serial number (upper case; the
-    /// device is matched case-insensitively). Fixed to one unit whatever the order.
-    Serial(String),
-}
-
-impl std::fmt::Display for DeviceSel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeviceSel::Index(n) => write!(f, "DeviceIndex {n}"),
-            DeviceSel::Serial(s) => write!(f, "serial {s}"),
-        }
-    }
-}
-
-/// A `[BS]` / `[CS110]` section as a space; `None` without valid lines.
-fn satellite_space(ini: &Ini, section: &str) -> Option<Space> {
-    let props = ini.section(Some(section))?;
-    let channels: Vec<_> = props
-        .iter()
-        .filter_map(|(k, v)| satellite_channel(&restore_key(k), v))
-        .collect();
-    (!channels.is_empty()).then(|| Space {
-        name: section.to_owned(),
-        channels,
-    })
-}
-
-/// `GetPrivateProfileStringW(L"Tuner", key, ...)`: the first value, with one pair of
-/// enclosing quotes removed. `None` if the key is absent (an empty value is `Some("")`).
+/// `GetPrivateProfileStringW(L"Tuner", key, ...)` ([`profile::get`]).
 fn tuner_string<'a>(ini: &'a Ini, key: &str) -> Option<&'a str> {
-    ini.get_from(Some("Tuner"), key).map(unquote)
+    profile::get(ini, "Tuner", key)
 }
 
-/// `GetPrivateProfileIntW(L"Tuner", key, default)`.
+/// `GetPrivateProfileIntW(L"Tuner", key, default)` ([`profile::get_int`]).
 fn tuner_int(ini: &Ini, key: &str, default: u32) -> u32 {
-    match tuner_string(ini, key) {
-        None | Some("") => default,
-        Some(s) => profile_int(s),
-    }
-}
-
-fn unquote(v: &str) -> &str {
-    let b = v.as_bytes();
-    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
-        &v[1..v.len() - 1]
-    } else {
-        v
-    }
-}
-
-/// The integer syntax of `GetPrivateProfileIntW` (`RtlUnicodeStringToInteger`, base
-/// 0): leading blanks, a sign, `0x` / `0o` / `0b` prefixes, digits up to the first
-/// other character (none = 0), modulo 2^32.
-pub fn profile_int(s: &str) -> u32 {
-    let t = s.trim_start_matches(|c: char| c <= ' ');
-    let (neg, t) = match t.as_bytes().first() {
-        Some(b'-') => (true, &t[1..]),
-        Some(b'+') => (false, &t[1..]),
-        _ => (false, t),
-    };
-    let (radix, digits) = match t.as_bytes() {
-        [b'0', b'x' | b'X', ..] => (16, &t[2..]),
-        [b'0', b'o' | b'O', ..] => (8, &t[2..]),
-        [b'0', b'b' | b'B', ..] => (2, &t[2..]),
-        _ => (10, t),
-    };
-    let v = digits
-        .chars()
-        .map_while(|c| c.to_digit(radix))
-        .fold(0u32, |acc, d| acc.wrapping_mul(radix).wrapping_add(d));
-    if neg { v.wrapping_neg() } else { v }
-}
-
-/// The ini file's text: UTF-8 (with or without BOM), UTF-16LE with BOM, or else the
-/// ANSI code page (what `GetPrivateProfileStringW` assumes for a BOM-less file).
-pub fn decode_ini(bytes: &[u8]) -> String {
-    if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
-        return String::from_utf8_lossy(rest).into_owned();
-    }
-    if let Some(rest) = bytes.strip_prefix(b"\xFF\xFE") {
-        return String::from_utf16le_lossy(rest);
-    }
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_owned(),
-        Err(_) => crate::sys::decode_ansi(bytes),
-    }
-}
-
-/// Stand-ins for characters `rust-ini` would treat specially inside a key (`:` is
-/// also a key/value separator there; `\` before the separator would swallow it).
-const KEY_STANDINS: [(char, char); 2] = [(':', '\u{E03A}'), ('\\', '\u{E05C}')];
-
-fn restore_key(k: &str) -> String {
-    KEY_STANDINS
-        .iter()
-        .fold(k.to_owned(), |s, &(orig, standin)| {
-            s.replace(standin, &orig.to_string())
-        })
-}
-
-/// Parse ini text with `rust-ini` (escapes and quotes off) after normalising it to
-/// the lines the Win32 profile API would see: blank, `;` / `#` comment and
-/// separator-less lines dropped, `[section]` headers cut after the `]`, keys
-/// protected (see `KEY_STANDINS`), and no backslash line continuation. A
-/// leading UTF-8 BOM is stripped.
-pub fn parse_ini(text: &str) -> Result<Ini, ini::ParseError> {
-    let text = text.trim_prefix('\u{FEFF}');
-    let mut norm = String::with_capacity(text.len());
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with([';', '#']) {
-            continue;
-        }
-        if line.starts_with('[') {
-            match line.find(']') {
-                Some(end) => norm.push_str(&line[..=end]),
-                None => continue, // not a section header
-            }
-        } else {
-            let Some(eq) = line.find('=').filter(|&eq| eq > 0) else {
-                continue; // no key=value
-            };
-            let key = KEY_STANDINS
-                .iter()
-                .fold(line[..eq].to_owned(), |s, &(orig, standin)| {
-                    s.replace(orig, &standin.to_string())
-                });
-            norm.push_str(&key);
-            norm.push_str(&line[eq..]);
-            if line.ends_with('\\') {
-                norm.push(' '); // a trailing '\' would continue the value on the next line
-            }
-        }
-        norm.push('\n');
-    }
-    Ini::load_from_str_opt(
-        &norm,
-        ParseOption {
-            enabled_quote: false,
-            enabled_escape: false,
-            enabled_indented_mutiline_value: false,
-            enabled_preserve_key_leading_whitespace: false,
-        },
-    )
+    profile::get_int(ini, "Tuner", key, default)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dt295::System;
 
     fn paths() -> ModulePaths {
         ModulePaths::from_module_path(OsStr::new(r"C:\TVTest\BonDriver\BonDriver_DT295.dll"))
     }
 
     fn config(text: &str) -> Config {
-        Config::from_ini(&parse_ini(text).expect("parses"), &paths())
+        Config::from_ini(&profile::parse(text).expect("parses"), &paths())
     }
 
     #[test]
@@ -381,13 +200,12 @@ mod tests {
             p.sibling(".ini"),
             PathBuf::from(r"C:\TVTest\BonDriver\BonDriver_DT295.ini")
         );
-        assert_eq!(p.resolve(r"D:\fw\a.bin"), PathBuf::from(r"D:\fw\a.bin"));
+        // Relative paths are under the DLL folder.
+        let fw = |v: &str| config(&format!("[Tuner]\nFirmware={v}\n")).firmware;
+        assert_eq!(fw(r"D:\fw\a.bin"), PathBuf::from(r"D:\fw\a.bin"));
+        assert_eq!(fw(r"\\nas\fw\a.bin"), PathBuf::from(r"\\nas\fw\a.bin"));
         assert_eq!(
-            p.resolve(r"\\nas\fw\a.bin"),
-            PathBuf::from(r"\\nas\fw\a.bin")
-        );
-        assert_eq!(
-            p.resolve(r"fw\a.bin"),
+            fw(r"fw\a.bin"),
             PathBuf::from(r"C:\TVTest\BonDriver\fw\a.bin")
         );
         let none = ModulePaths::from_module_path(OsStr::new(""));
@@ -446,7 +264,7 @@ mod tests {
         let copy =
             ModulePaths::from_module_path(OsStr::new(r"C:\TVTest\BonDriver\BonDriver_DT295-1.dll"));
         let files = |text: &str| {
-            let c = Config::from_ini(&parse_ini(text).expect("parses"), &copy);
+            let c = Config::from_ini(&profile::parse(text).expect("parses"), &copy);
             (c.log_file, c.state_file)
         };
         let log = || Some(PathBuf::from(r"C:\TVTest\BonDriver\BonDriver_DT295-1.log"));
@@ -574,44 +392,30 @@ Firmware=
     }
 
     #[test]
+    fn channel_file() {
+        let c = config("");
+        assert_eq!(
+            c.channel_file_log,
+            Ok(Vec::new()),
+            "none: the ini's own spaces"
+        );
+        // One that cannot be read: no spaces (the ini's own would number them otherwise)
+        let c =
+            config("[Tuner]\nChannelFile=Z:\\absent\\BonDriver_PT3-S.ChSet.txt\n[BS]\nA=1049480\n");
+        assert!(c.spaces.is_empty());
+        let e = c.channel_file_log.unwrap_err();
+        assert!(
+            e.starts_with(r"ChannelFile Z:\absent\BonDriver_PT3-S.ChSet.txt: "),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn raw_ts_mode() {
         // Absent / 0 = the System1 path; RawTS=1 = the blob-free raw-TS path.
         assert!(!config("").raw_ts);
         assert!(!config("[Tuner]\nRawTS=0\n").raw_ts);
         assert!(config("[Tuner]\nRawTS=1\n").raw_ts);
-    }
-
-    #[test]
-    fn satellite_sections() {
-        let c = config(
-            "[Tuner]\nUHF=0\nCATV=0\n\
-             [BS]\n\
-             ; BS-1 (11727.48 MHz): comment without '='\n\
-             BS01/TS0=1049480,0x4010,151\n\
-             BS01/TS1 = 1049480 , 0x4011\n\
-             a stray line\n\
-             =1049480,0x4012\n\
-             J:COM BS=1471440,0x4973,260\n\
-             back\\slash=1471440,0x4973\n\
-             Out of range=100000,0x4010\n\
-             [CS110]\n\
-             ND02/296=1613000,0x6020,296 ; not a comment for Win32 either\n\
-             [Empty]\n",
-        );
-        assert_eq!(c.spaces.len(), 2);
-        let bs = &c.spaces[0];
-        assert_eq!(bs.name, "BS");
-        let names: Vec<_> = bs.channels.iter().map(|ch| ch.name.as_str()).collect();
-        assert_eq!(names, ["BS01/TS0", "BS01/TS1", "J:COM BS", "back\\slash"]);
-        assert_eq!(bs.channels[0].sid, Some(151));
-        // wcstoul stops at the blank before ',': TSID stays "none".
-        assert_eq!(bs.channels[1].tsid, 0xFFFF);
-        assert_eq!(bs.channels[2].tsid, 0x4973);
-        assert_eq!(bs.channels[2].sys, System::Satellite);
-        let cs = &c.spaces[1];
-        assert_eq!(cs.name, "CS110");
-        assert_eq!(cs.channels.len(), 1);
-        assert_eq!(cs.channels[0].sid, Some(296));
     }
 
     #[test]
@@ -645,33 +449,5 @@ Firmware=
         assert_eq!(line(2, "BS13/TS2"), (1_279_640_000, 0x46D2));
         assert_eq!(line(2, "BS01/TS1"), (1_049_480_000, 0x4011));
         assert_eq!(line(3, "ND06/TS0"), (1_693_000_000, 0x7060));
-    }
-
-    #[test]
-    fn profile_int_syntax() {
-        assert_eq!(profile_int("1"), 1);
-        assert_eq!(profile_int("  42abc"), 42);
-        assert_eq!(profile_int("0x10"), 16);
-        assert_eq!(profile_int("010"), 10);
-        assert_eq!(profile_int("-1"), u32::MAX);
-        assert_eq!(profile_int("yes"), 0);
-        assert_eq!(profile_int("+7"), 7);
-    }
-
-    #[test]
-    fn decoding() {
-        assert_eq!(decode_ini(b"\xEF\xBB\xBF[Tuner]"), "[Tuner]");
-        assert_eq!(decode_ini(b"\xFF\xFE[\0T\0]\0"), "[T]");
-        assert_eq!(decode_ini("[BS]\nあ=1".as_bytes()), "[BS]\nあ=1");
-        // Not UTF-8: decoded with the ANSI code page (never fails).
-        assert!(decode_ini(b"[BS]\n\x82\xa0=1").starts_with("[BS]\n"));
-    }
-
-    #[test]
-    fn unquoting() {
-        assert_eq!(unquote("\"a b\""), "a b");
-        assert_eq!(unquote("'a'"), "a");
-        assert_eq!(unquote("\"a'"), "\"a'");
-        assert_eq!(unquote("\""), "\"");
     }
 }

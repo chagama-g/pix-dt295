@@ -29,6 +29,7 @@ mod lineup;
 mod list;
 mod logo;
 mod mirakc;
+mod rawts;
 mod reg;
 mod sections;
 // the configuration and the protocol build everywhere (their tests run on Windows too)
@@ -59,7 +60,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Boot the device, tune, and write the TS (every service, or the one of --sid) to a
-    /// file or stdout.
+    /// file or stdout; with --raw-ts the scrambled TS, booting nothing.
     Capture(CaptureArgs),
     /// List the connected PIX-DT295 units: DeviceIndex, USB serial number, whether free.
     List,
@@ -105,25 +106,39 @@ enum StateCommand {
 /// `dt295 capture` options (the frequencies in Hz).
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("band").required(true).args(["ter", "sat", "channel"])))]
-#[command(group(ArgGroup::new("firmware").required(true).args(["fw", "bondriver", "config"])))]
+#[command(group(
+    ArgGroup::new("firmware")
+        .required(true)
+        .multiple(true)
+        .args(["fw", "bondriver", "config", "raw_ts"])
+))]
 pub struct CaptureArgs {
     #[command(flatten)]
     pub dev: tuner::DeviceArgs,
 
     /// A BonDriver_DT295 ini (on Linux a file of the same format): the firmware,
-    /// the unit, the state file and the channels for --channel. Options given
+    /// the unit, the state file, RawTS and the channels for --channel. Options given
     /// here win over it.
-    #[arg(long, value_name = "INI")]
+    #[arg(long, value_name = "INI", conflicts_with = "fw")]
     pub bondriver: Option<PathBuf>,
 
-    /// The configuration of `dt295 serve` (/etc/dt295.conf): the firmware and the
-    /// unit's state file from it, so the link key carries over between the daemon and
-    /// a capture (stop the daemon first: it holds its units).
-    #[arg(short = 'c', long, value_name = "FILE", conflicts_with = "bondriver")]
+    /// The configuration of `dt295 serve` (/etc/dt295.conf): the firmware, the unit's
+    /// state file and raw-ts from it, so the link key carries over between the daemon
+    /// and a capture (stop the daemon first: it holds its units).
+    #[arg(short = 'c', long, value_name = "FILE", conflicts_with_all = ["bondriver", "fw"])]
     pub config: Option<PathBuf>,
 
-    /// A channel by name: a [BS] / [CS110] line of --bondriver (e.g. BS15/TS1), or
-    /// a built-in terrestrial one (27ch, C13ch).
+    /// Stream on the blob-free raw-TS path: no vendor firmware and no state file, the
+    /// TS stays scrambled for the host to descramble with a real card, every service of
+    /// it. A RawTS=1 ini or a raw-ts = true unit selects it too. The first tune after a
+    /// plug brings the chip up (some seconds); later ones, in this process or the next,
+    /// only retune. A unit booted with the vendor firmware since its plug needs a
+    /// re-plug first.
+    #[arg(long, conflicts_with_all = ["fw", "trc", "state", "sid"])]
+    pub raw_ts: bool,
+
+    /// A channel by name: one of --bondriver (a [BS] / [CS110] line, e.g. BS15/TS1, or
+    /// a channel of its ChannelFile), or a built-in terrestrial one (27ch, C13ch).
     #[arg(long, value_name = "NAME", conflicts_with_all = ["ter", "sat", "tsid"])]
     pub channel: Option<String>,
 
@@ -135,7 +150,8 @@ pub struct CaptureArgs {
     #[arg(long, value_name = "HZ", value_parser = parse_u32)]
     pub sat: Option<u32>,
 
-    /// ISDB-S: the broadcast transport_stream_id in hex (e.g. 40f1 or 0x40F1).
+    /// ISDB-S: the broadcast transport_stream_id in hex (e.g. 40f1 or 0x40F1); 7 or
+    /// less is a TS number, the TS whose TSID has those low 3 bits.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16, conflicts_with = "ter")]
     pub tsid: Option<u16>,
 

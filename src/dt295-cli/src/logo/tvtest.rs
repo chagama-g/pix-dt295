@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use dt295::ts::crc::crc32;
 
 use super::carousel::Logo;
-use crate::bonini::{BonDriver, ini_section};
+use crate::bonini::BonDriver;
 
 /// TVTest skips a logo of this size or smaller (a transparent placeholder).
 pub(super) const TRANSPARENT_MAX: usize = 93;
@@ -482,6 +482,44 @@ pub(super) fn decode_text(b: &[u8]) -> String {
     }
 }
 
+/// The name of a `[name]` section header; what follows the `]` is ignored.
+fn header(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    Some(rest[..rest.find(']')?].trim())
+}
+
+/// The `key=value` lines of one section (keys and values trimmed), in file order;
+/// `;` / `#` comments and lines without `=` are skipped.
+fn ini_lines(text: &str, section: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if let Some(name) = header(line) {
+            inside = name.eq_ignore_ascii_case(section);
+            continue;
+        }
+        let line = line.trim();
+        if !inside || line.starts_with([';', '#']) {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            out.push((k.trim().to_owned(), v.trim().to_owned()));
+        }
+    }
+    out
+}
+
+/// The keys of one section of TVTest.ini, lower-cased, values without surrounding
+/// quotes; the first of repeated keys wins.
+pub(super) fn ini_section(text: &str, section: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (k, v) in ini_lines(text, section) {
+        let v = v.strip_circumfix('"', '"').unwrap_or(&v).to_owned();
+        out.entry(k.to_ascii_lowercase()).or_insert(v);
+    }
+    out
+}
+
 pub(super) fn encode_text(text: &str, utf16: bool) -> Vec<u8> {
     if utf16 {
         let mut b = vec![0xFF, 0xFE];
@@ -502,17 +540,15 @@ pub(super) fn pick_unit<'a>(
     bons: &'a [BonDriver],
 ) -> Option<(String, Option<&'a BonDriver>)> {
     for s in free {
-        let named = bons.iter().find(|b| {
-            b.serial
-                .as_deref()
-                .is_some_and(|x| x.eq_ignore_ascii_case(s))
-        });
+        let named = bons
+            .iter()
+            .find(|b| b.serial().is_some_and(|x| x.eq_ignore_ascii_case(s)));
         if let Some(b) = named {
             return Some((s.clone(), Some(b)));
         }
     }
     let first = free.first()?;
-    let unnamed: Vec<_> = bons.iter().filter(|b| b.serial.is_none()).collect();
+    let unnamed: Vec<_> = bons.iter().filter(|b| b.serial().is_none()).collect();
     let bon = (connected == 1 && unnamed.len() == 1).then(|| unnamed[0]);
     Some((first.clone(), bon))
 }

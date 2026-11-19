@@ -15,14 +15,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use dt295::bonini::DeviceSel;
+use dt295::chan::{self, Channel, Space};
 use dt295::{
-    CardWatch, Device, Live, RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, System, TsSink, raw_stall_due,
+    CardWatch, Device, Live, RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, System, TsSink, profile,
+    raw_stall_due,
 };
 use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 
-use crate::channels::{Channel, Space};
-use crate::config::{Config, DeviceSel, ModulePaths, decode_ini, parse_ini};
+use crate::config::{Config, ModulePaths};
 use crate::fifo::{TS_CHUNK, TS_FIFO_SIZE, TsFifo};
 use crate::logging::{self, LogSession};
 use crate::persist::Persist;
@@ -37,10 +39,6 @@ pub const WAIT_ABANDONED: u32 = 0x80;
 /// A `WaitTsStream` timeout meaning "forever" (as is `0`).
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 
-/// Attempts and pause of the device open: after a close (or a crash) the WinUSB
-/// handle can linger for a moment, and a fresh open fails until the OS releases it.
-const OPEN_ATTEMPTS: usize = 5;
-const OPEN_RETRY_PAUSE: Duration = Duration::from_millis(400);
 /// How often a unit that went away is looked for again.
 const REOPEN_EVERY: Duration = Duration::from_secs(2);
 /// How often an open unit that is not streaming is checked to be still plugged in (a
@@ -158,8 +156,10 @@ struct Core {
     selected: Option<(u32, u32)>,
     /// When to start the stream over (per opened device).
     watch: Option<CardWatch>,
-    /// The device went away (unplugged) while open: open it again once it is back.
-    lost: bool,
+    /// The device went away (unplugged) while open: the unit to open again once it is back,
+    /// by its serial (not `device`: with a `DeviceIndex` another unit plugged in would take
+    /// its number); `None` = none lost.
+    lost: Option<DeviceSel>,
     next_reopen: Option<Instant>,
     /// The last check that an open device not streaming is still plugged in.
     last_presence: Instant,
@@ -194,33 +194,21 @@ impl Core {
         }
     }
 
-    /// Open the configured unit (with retries: after a close or a crash the WinUSB
-    /// handle can linger for a moment), select the trc firmware, hand over the saved
-    /// state, and boot it. `who` names the caller in the log.
-    fn open_device(&mut self, who: &str) -> Option<Device> {
-        let open = |sel: &DeviceSel| match sel {
-            DeviceSel::Index(n) => Device::open(*n),
-            DeviceSel::Serial(s) => Device::open_serial(s),
-        };
-        let mut opened = open(&self.device);
-        for _ in 1..OPEN_ATTEMPTS {
-            if opened.is_ok() {
-                break;
-            }
-            thread::sleep(OPEN_RETRY_PAUSE);
-            opened = open(&self.device);
-        }
-        let mut dev = match opened {
+    /// Open the unit `sel` (the configured one, or the one that went away), with retries:
+    /// after a close or a crash the WinUSB handle can linger for a moment. Then select the
+    /// trc firmware, hand over the saved state, and boot it. `who` names the caller in the
+    /// log.
+    fn open_device(&mut self, who: &str, sel: &DeviceSel) -> Option<Device> {
+        let mut dev = match Device::open_sel(sel) {
             Ok(dev) => dev,
             Err(e) => {
-                warn!("{who}: cannot open device ({}): {e}", self.device);
+                warn!("{who}: cannot open device ({sel}): {e}");
                 return None;
             }
         };
         info!(
-            "{who}: device serial {} ({})",
-            dev.serial().unwrap_or("unknown"),
-            self.device
+            "{who}: device serial {} ({sel})",
+            dev.serial().unwrap_or("unknown")
         );
         if self.raw.is_some() {
             // Raw-TS: do not boot the idle firmware. The first capture bootstraps the
@@ -252,7 +240,7 @@ impl Core {
         self.dev = Some(dev);
         self.sh.opening.store(true, Ordering::Release);
         self.recovery_failed = false;
-        self.lost = false;
+        self.lost = None;
         self.last_presence = Instant::now();
     }
 
@@ -266,12 +254,13 @@ impl Core {
             // adopt/resume (no re-plug); no PSI / link-key persistence (the host
             // descrambles).
             if self.dev.as_ref().is_some_and(Device::raw_present)
-                && let Some(dev) = self.dev.as_mut() {
-                    match dev.stream_stop_raw() {
-                        Ok(stats) => info!("raw-TS stream stopped ({} bytes)", stats.bytes),
-                        Err(e) => warn!("raw-TS stream stop failed ({e})"),
-                    }
+                && let Some(dev) = self.dev.as_mut()
+            {
+                match dev.stream_stop_raw() {
+                    Ok(stats) => info!("raw-TS stream stopped ({} bytes)", stats.bytes),
+                    Err(e) => warn!("raw-TS stream stop failed ({e})"),
                 }
+            }
             self.streaming = false;
             self.raw_rx = None;
             self.sh.log_fifo_drops();
@@ -298,17 +287,24 @@ impl Core {
     /// True only when a stream runs.
     fn set_channel(&mut self, space: u32, channel: u32) -> bool {
         let (si, ci) = (space as usize, channel as usize);
-        let Some(&Channel {
+        let Some(ch) = self.spaces.get(si).and_then(|s| s.channels.get(ci)) else {
+            return false;
+        };
+        if let Some(why) = &ch.untunable {
+            info!(
+                "SetChannel({space}, {channel}): {} is no channel to tune ({why})",
+                ch.name
+            );
+            return false;
+        }
+        let &Channel {
             sys,
             freq_hz,
             tsid,
             sid,
             ..
-        }) = self.spaces.get(si).and_then(|s| s.channels.get(ci))
-        else {
-            return false;
-        };
-        if self.dev.is_none() && self.lost {
+        } = ch;
+        if self.dev.is_none() && self.lost.is_some() {
             self.try_reopen(); // re-plugged, and a tune came before the keeper saw it back
         }
         if self.dev.is_none() {
@@ -471,7 +467,7 @@ impl Core {
             self.spaces
                 .get(space as usize)
                 .and_then(|sp| sp.channels.get(channel as usize))
-                .is_some_and(|c| c.sys == System::Terrestrial)
+                .is_some_and(|c| c.sys == System::Terrestrial && c.untunable.is_none())
         })
     }
 
@@ -497,7 +493,9 @@ impl Core {
     /// re-plug; false when no device is open, so the next tune does the full bring-up. Only
     /// call it with no worker running (it does host device I/O).
     fn cold_monitor_present(&self) -> bool {
-        self.dev.as_ref().is_some_and(Device::cold_monitor_installed)
+        self.dev
+            .as_ref()
+            .is_some_and(Device::cold_monitor_installed)
     }
 
     /// Fully blob-free cold raw-TS channel set: stop the previous worker, then bring the
@@ -644,7 +642,7 @@ impl Core {
             warn!("the device is gone (unplugged?): closed it; it is opened again when it is back");
             self.drop_device();
         }
-        if self.lost {
+        if self.lost.is_some() {
             if self.next_reopen.is_none_or(|t| now >= t) {
                 self.next_reopen = Some(now + REOPEN_EVERY);
                 if self.try_reopen()
@@ -678,7 +676,7 @@ impl Core {
     /// re-open. There is no B-CAS session to watch (the host descrambles).
     fn watch_tick_raw(&mut self) {
         let now = Instant::now();
-        if self.lost {
+        if self.lost.is_some() {
             if self.next_reopen.is_none_or(|t| now >= t) {
                 self.next_reopen = Some(now + REOPEN_EVERY);
                 if self.try_reopen()
@@ -718,7 +716,9 @@ impl Core {
             // worker + re-tune) -- a transient stall recovers, a hard one reports no-lock.
             let rx = self.sh.fifo.received();
             if raw_stall_due(&mut self.raw_rx, rx, now) {
-                warn!("raw-TS: no TS for {RAW_STALL:?} while streaming -- datapath stalled; restarting");
+                warn!(
+                    "raw-TS: no TS for {RAW_STALL:?} while streaming -- datapath stalled; restarting"
+                );
                 if let Some((space, channel)) = self.selected {
                     self.set_channel(space, channel);
                 }
@@ -735,12 +735,12 @@ impl Core {
         }
     }
 
-    /// Whether the configured unit is plugged in (true when that cannot be told).
+    /// Whether the unit is plugged in (true when that cannot be told): the open one by its
+    /// serial, else the one that went away, else the configured one ([`unit_present`]).
     fn present(&self) -> bool {
-        dt295::present_serials().map_or(true, |serials| match &self.device {
-            DeviceSel::Serial(s) => serials.iter().any(|p| p.eq_ignore_ascii_case(s)),
-            DeviceSel::Index(n) => serials.len() > *n,
-        })
+        let open = self.dev.as_ref().and_then(Device::serial);
+        let sel = self.lost.as_ref().unwrap_or(&self.device);
+        dt295::present_serials().map_or(true, |serials| unit_present(&serials, sel, open))
     }
 
     /// Close a device that went away; [`Core::watch_tick`] opens it again.
@@ -755,20 +755,28 @@ impl Core {
         self.snapshot_psi();
         self.save_state();
         *lock(&self.sh.live) = None;
+        // the same unit comes back, not whichever takes its DeviceIndex
+        let serial = self.dev.as_ref().and_then(Device::serial);
+        self.lost = Some(serial.map_or_else(
+            || self.device.clone(),
+            |s| DeviceSel::Serial(s.to_ascii_uppercase()),
+        ));
         self.dev = None; // closes it
         self.watch = None;
-        self.lost = true;
         self.next_reopen = None;
         // The chip resets on a re-plug, so the next tune does the full cold bring-up again;
         // that is decided by probing the chip (no monitor present), not tracked here.
     }
 
-    /// Open a unit that went away, if it is back. True when it is open again.
+    /// Open the unit that went away, if it is back. True when it is open again.
     fn try_reopen(&mut self) -> bool {
+        let Some(sel) = self.lost.clone() else {
+            return false;
+        };
         if !self.present() {
             return false;
         }
-        match self.open_device("reopen") {
+        match self.open_device("reopen", &sel) {
             Some(dev) => {
                 info!("the device is back: opened it again");
                 self.adopt(dev);
@@ -814,8 +822,9 @@ pub struct Driver {
     core: Arc<Mutex<Core>>,
     sh: Arc<Shared>,
     names: Vec<SpaceNames>,
-    /// The space `SetChannel(BYTE)` maps UHF channel numbers into.
-    uhf_space: Option<usize>,
+    /// What `SetChannel(BYTE)` tunes for UHF 13-62ch (index `n - 13`): the first channel
+    /// at its frequency, of whichever space ([`uhf_channels`]).
+    uhf: Vec<Option<(u32, u32)>>,
     /// The buffer behind `GetTsStream(BYTE **)`.
     out: Mutex<Box<[u8]>>,
     idle: Mutex<Option<IdleKeeper>>,
@@ -838,11 +847,11 @@ impl Driver {
             .unwrap_or_default();
         let ini_path = paths.sibling(".ini");
         let text = std::fs::read(&ini_path)
-            .map(|b| decode_ini(&b))
+            .map(|b| profile::decode(&b))
             .unwrap_or_default(); // no ini: all defaults
-        let (ini, ini_error) = match parse_ini(&text) {
+        let (ini, ini_error) = match profile::parse(&text) {
             Ok(ini) => (ini, None),
-            Err(e) => (ini::Ini::new(), Some(e)),
+            Err(e) => (profile::Ini::new(), Some(e)),
         };
         let cfg = Config::from_ini(&ini, &paths);
         logging::set_level(*cfg.log_level.as_ref().unwrap_or(&LevelFilter::INFO));
@@ -861,6 +870,10 @@ impl Driver {
                 ini_path.display()
             );
         }
+        match &cfg.channel_file_log {
+            Ok(lines) => lines.iter().for_each(|l| info!("ini: {l}")),
+            Err(e) => warn!("ini: {e}; no tuning spaces"),
+        }
         Self::with_config(cfg, log)
     }
 
@@ -877,7 +890,7 @@ impl Driver {
                 channels: s.channels.iter().map(|c| wide_z(&c.name)).collect(),
             })
             .collect();
-        let uhf_space = spaces.iter().position(|s| s.name == "UHF");
+        let uhf = uhf_channels(&spaces);
         let sh = Arc::new(Shared {
             fifo: TsFifo::new(TS_FIFO_SIZE),
             live: Mutex::new(None),
@@ -887,7 +900,9 @@ impl Driver {
             opening: AtomicBool::new(false),
         });
         let raw = cfg.raw_ts.then(|| {
-            info!("raw-TS mode: blob-free cold path (no resident, no aux core, no vendor firmware)");
+            info!(
+                "raw-TS mode: blob-free cold path (no resident, no aux core, no vendor firmware)"
+            );
             RawMode
         });
         Self {
@@ -906,13 +921,13 @@ impl Driver {
                 persist,
                 selected: None,
                 watch: None,
-                lost: false,
+                lost: None,
                 next_reopen: None,
                 last_presence: Instant::now(),
             })),
             sh,
             names,
-            uhf_space,
+            uhf,
             out: Mutex::new(vec![0; TS_CHUNK].into_boxed_slice()),
             idle: Mutex::new(None),
             log: Mutex::new(log),
@@ -922,18 +937,25 @@ impl Driver {
     // ---- tuner ----
 
     /// `OpenTuner`: open (with retries), select the trc firmware and hand over the
-    /// saved state, then boot. Already open: just make sure the keeper runs.
+    /// saved state (read again if another program may have written it since), then boot.
+    /// Already open: just make sure the keeper runs. A unit that went away and was not
+    /// closed since is the one to open, not whichever has its `DeviceIndex` now.
     pub fn open_tuner(&self) -> bool {
         let ok = {
             let mut core = lock(&self.core);
             if core.dev.is_some() {
                 true
-            } else if let Some(dev) = core.open_device("OpenTuner") {
-                core.adopt(dev);
-                core.prime_raw();
-                true
             } else {
-                false
+                core.persist.reload();
+                let sel = core.lost.clone().unwrap_or_else(|| core.device.clone());
+                match core.open_device("OpenTuner", &sel) {
+                    Some(dev) => {
+                        core.adopt(dev);
+                        core.prime_raw();
+                        true
+                    }
+                    None => false,
+                }
             }
         };
         if ok {
@@ -958,7 +980,7 @@ impl Driver {
             core.recovery_failed = false;
             core.selected = None;
             core.watch = None;
-            core.lost = false;
+            core.lost = None;
             self.sh.cur_space.store(NO_SELECTION, Ordering::Release);
             self.sh.cur_channel.store(NO_SELECTION, Ordering::Release);
             self.sh.set_last_level(0.0);
@@ -1041,11 +1063,10 @@ impl Driver {
 
     /// `SetChannel(BYTE)` (IBonDriver v1): the UHF physical channel 13-62.
     pub fn set_channel_byte(&self, ch: u8) -> bool {
-        match self.uhf_space {
-            Some(space) if (13..=62).contains(&ch) => {
-                self.set_channel(space as u32, u32::from(ch - 13))
-            }
-            _ => false,
+        let at = usize::from(ch).checked_sub(13);
+        match at.and_then(|i| self.uhf.get(i)).copied().flatten() {
+            Some((space, channel)) => self.set_channel(space, channel),
+            None => false,
         }
     }
 
@@ -1057,7 +1078,8 @@ impl Driver {
         let known = core
             .spaces
             .get(space as usize)
-            .is_some_and(|s| (channel as usize) < s.channels.len());
+            .and_then(|s| s.channels.get(channel as usize))
+            .is_some_and(|c| c.untunable.is_none());
         if known {
             core.selected = Some((space, channel));
             if let Some(w) = core.watch.as_mut() {
@@ -1147,6 +1169,38 @@ impl Drop for Driver {
     }
 }
 
+/// Whether a unit is among the plugged-in `serials`: the open one (`open`, its serial) by
+/// that serial, else the one `sel` names. An index counts every unit plugged in, in use
+/// elsewhere or not (an open skips those in use), so with another unit present it would
+/// not notice the open one going away; the serial does.
+fn unit_present(serials: &[String], sel: &DeviceSel, open: Option<&str>) -> bool {
+    let serial = match (open, sel) {
+        (Some(s), _) => s,
+        (None, DeviceSel::Serial(s)) => s.as_str(),
+        (None, DeviceSel::Index(n)) => return serials.len() > *n,
+    };
+    serials.iter().any(|p| p.eq_ignore_ascii_case(serial))
+}
+
+/// For UHF 13-62ch (index `n - 13`), the `(space, channel)` of the first channel to tune
+/// within 0.5 MHz of its centre, in space order: the built-in UHF space when it is
+/// listed, or the UHF channel of a channel file.
+fn uhf_channels(spaces: &[Space]) -> Vec<Option<(u32, u32)>> {
+    chan::UHF
+        .map(|n| {
+            let hz = chan::uhf_hz(n)?;
+            spaces.iter().enumerate().find_map(|(si, s)| {
+                let ci = s.channels.iter().position(|c| {
+                    c.untunable.is_none()
+                        && c.sys == System::Terrestrial
+                        && c.freq_hz.abs_diff(hz) < 500_000
+                })?;
+                Some((si as u32, ci as u32))
+            })
+        })
+        .collect()
+}
+
 /// The `(space, channel)` of the first enabled service in a parsed `.ch2` for which
 /// `is_terrestrial` holds (reading and parsing are shared in `dt295::ch2`).
 fn first_terrestrial_ch2_channel(
@@ -1200,13 +1254,12 @@ fn idle_keeper(core: &Mutex<Core>, stop: &mpsc::Receiver<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ModulePaths, parse_ini};
     use std::ffi::OsStr;
 
     fn driver(ini: &str) -> Driver {
         let paths =
             ModulePaths::from_module_path(OsStr::new(r"C:\nonexistent-dt295\BonDriver_DT295.dll"));
-        let mut cfg = Config::from_ini(&parse_ini(ini).unwrap(), &paths);
+        let mut cfg = Config::from_ini(&profile::parse(ini).unwrap(), &paths);
         cfg.state_file = None;
         Driver::with_config(cfg, None)
     }
@@ -1305,14 +1358,43 @@ mod tests {
     }
 
     #[test]
+    fn presence_of_the_unit() {
+        let plugged = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let index0 = DeviceSel::Index(0);
+        // Our unit (B) went away while another one (A, in use elsewhere) stays: by the
+        // index, one unit is still there; by the serial of the open unit, ours is gone.
+        assert!(unit_present(&plugged(&["A"]), &index0, None));
+        assert!(!unit_present(&plugged(&["A"]), &index0, Some("B")));
+        assert!(unit_present(&plugged(&["A", "b"]), &index0, Some("B")));
+        // Not open (a re-open): the configured unit.
+        assert!(!unit_present(&plugged(&[]), &index0, None));
+        assert!(!unit_present(&plugged(&["A"]), &DeviceSel::Index(1), None));
+        let by_serial = DeviceSel::Serial("CD23456789".into());
+        assert!(unit_present(&plugged(&["cd23456789"]), &by_serial, None));
+        assert!(!unit_present(&plugged(&["A"]), &by_serial, None));
+    }
+
+    #[test]
     fn set_channel_byte_needs_uhf() {
         let d = driver("[Tuner]\nUHF=0\n");
-        assert_eq!(d.uhf_space, None);
+        assert!(d.uhf.iter().all(Option::is_none), "CATV is no UHF");
         assert!(!d.set_channel_byte(27));
         let d = driver("");
-        assert_eq!(d.uhf_space, Some(0));
+        assert_eq!((d.uhf[0], d.uhf[14]), (Some((0, 0)), Some((0, 14))));
         assert!(!d.set_channel_byte(12));
         assert!(!d.set_channel_byte(63));
+        // by frequency, in whichever space (a channel file's: BDA's 473.143 MHz)
+        let mut c = chan::uhf_space();
+        c.kind = chan::SpaceKind::File;
+        c.channels.truncate(3);
+        c.channels[1].freq_hz = 479_143_000;
+        c.channels[2].untunable = Some("no definition".into());
+        let other = Space {
+            channels: Vec::new(),
+            ..c.clone()
+        };
+        let u = uhf_channels(&[other, c]);
+        assert_eq!(&u[..3], [Some((1, 0)), Some((1, 1)), None]);
     }
 
     #[test]

@@ -14,9 +14,9 @@
 //! (`<service id>.png`, as `dt295 logo --mirakc` writes them): mirakc does not collect
 //! logos itself, and its configuration is a single file.
 //!
-//! A `.ch2` numbers the tuning spaces the way the BonDriver lists them: UHF and CATV
-//! (unless `[Tuner] UHF` / `CATV` turn them off), then BS and CS110 when they have
-//! lines; the satellite channels are the lines whose value parses.
+//! A `.ch2` numbers the tuning spaces the way the BonDriver lists them, and the ini
+//! gives them with the BonDriver's own reading ([`dt295::chan::ini_spaces`]; the spaces of
+//! its `ChannelFile` too, whose channels are GR, BS or CS by what they tune).
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -26,9 +26,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use dt295::chan::{self, NO_TSID, SatLine};
+use dt295::System;
+use dt295::chan::{NO_TSID, Space, SpaceKind};
 
-use crate::bonini::{decode_ini, ini_lines, ini_section};
+use crate::bonini::BonDriver;
 use dt295::ch2;
 
 mod psi;
@@ -135,8 +136,7 @@ pub fn run(a: &MirakcArgs) -> Result<()> {
 
 /// The channels of a TVTest scan, what was left out, and the source's name.
 fn from_tvtest(ini: &Path, ch2: Option<&Path>) -> Result<(Vec<Channel>, Vec<String>, String)> {
-    let text = fs::read(ini).with_context(|| format!("cannot read {}", ini.display()))?;
-    let spaces = spaces(&decode_ini(&text));
+    let spaces = BonDriver::load(ini)?.spaces;
     let ch2_path = ch2.map_or_else(|| ini.with_extension("ch2"), Path::to_path_buf);
     let services =
         ch2::read(&ch2_path).with_context(|| format!("cannot read {}", ch2_path.display()))?;
@@ -154,45 +154,6 @@ fn from_scan(a: &MirakcArgs, serial: &str) -> Result<(Vec<Channel>, Vec<String>,
 #[cfg(not(unix))]
 fn from_scan(_: &MirakcArgs, _: &str) -> Result<(Vec<Channel>, Vec<String>, String)> {
     bail!("--scan is only on Linux (it scans through dt295 serve)")
-}
-
-/// A tuning space of the BonDriver, in its order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Space {
-    Uhf,
-    Catv,
-    /// `[BS]` (`bs`) or `[CS110]`: the lines that parse, in file order.
-    Satellite {
-        bs: bool,
-        lines: Vec<(String, SatLine)>,
-    },
-}
-
-fn spaces(ini: &str) -> Vec<Space> {
-    let tuner = ini_section(ini, "Tuner");
-    // GetPrivateProfileInt: absent = 1, else the leading number ("yes" = 0)
-    let on = |key: &str| tuner.get(key).is_none_or(|v| chan::strtol(v).0 != 0);
-    let lines = |section: &str| -> Vec<(String, SatLine)> {
-        ini_lines(ini, section)
-            .into_iter()
-            .filter(|(name, _)| !name.is_empty())
-            .filter_map(|(name, value)| Some((name, chan::satellite_line(&value)?)))
-            .collect()
-    };
-    let mut out = Vec::new();
-    if on("uhf") {
-        out.push(Space::Uhf);
-    }
-    if on("catv") {
-        out.push(Space::Catv);
-    }
-    for (section, bs) in [("BS", true), ("CS110", false)] {
-        let lines = lines(section);
-        if !lines.is_empty() {
-            out.push(Space::Satellite { bs, lines });
-        }
-    }
-    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,38 +190,47 @@ fn channels(spaces: &[Space], services: &[ch2::Service]) -> (Vec<Channel>, Vec<S
     for s in services.iter().filter(|s| s.enabled) {
         let what = format!("{} (service {})", s.name, s.sid);
         let ch = s.channel;
-        let mapped = match spaces.get(s.space as usize) {
-            Some(Space::Uhf) => chan::uhf_hz(13 + ch).map(|hz| {
-                (
-                    "GR",
-                    format!("{}", 13 + ch),
-                    format!("--ter {hz}"),
-                    format!("UHF {}ch", 13 + ch),
-                )
-            }),
-            Some(Space::Catv) => chan::catv_hz(13 + ch).map(|hz| {
-                (
-                    "GR",
-                    format!("C{}", 13 + ch),
-                    format!("--ter {hz}"),
-                    format!("CATV C{}ch", 13 + ch),
-                )
-            }),
-            Some(Space::Satellite { bs, lines }) => lines.get(ch as usize).map(|(name, line)| {
-                let tsid = if line.tsid == NO_TSID {
+        let space = spaces.get(s.space as usize);
+        let line = space.and_then(|sp| Some((sp, sp.channels.get(ch as usize)?)));
+        if let Some((sp, c)) = line
+            && let Some(why) = &c.untunable
+        {
+            skipped.push(format!(
+                "{what}: {} {} is no channel to tune ({why})",
+                sp.name, c.name
+            ));
+            continue;
+        }
+        // a channel file's: by what it tunes (a BS IF is below 1.6 GHz, a CS110 one above)
+        let kind = |sp: &Space, c: &dt295::chan::Channel| match sp.kind {
+            SpaceKind::File if c.sys == System::Terrestrial => SpaceKind::Uhf,
+            SpaceKind::File if c.freq_hz < 1_600_000_000 => SpaceKind::Bs,
+            SpaceKind::File => SpaceKind::Cs110,
+            k => k,
+        };
+        let mapped = line.map(|(sp, c)| match kind(sp, c) {
+            // 27ch: "27", C27ch: "C27"
+            SpaceKind::Uhf | SpaceKind::Catv | SpaceKind::File => (
+                "GR",
+                c.name.strip_suffix("ch").unwrap_or(&c.name).to_owned(),
+                format!("--ter {}", c.freq_hz),
+                format!("{} {}", sp.name, c.name),
+            ),
+            k @ (SpaceKind::Bs | SpaceKind::Cs110) => {
+                // without a TSID, or with a TS number: the service's
+                let tsid = if c.tsid == NO_TSID || c.ts_number().is_some() {
                     s.tsid
                 } else {
-                    line.tsid
+                    c.tsid
                 };
                 (
-                    if *bs { "BS" } else { "CS" },
-                    name.replace('/', "_"),
-                    format!("--sat {} --tsid {tsid:04x}", line.freq_hz),
-                    name.clone(),
+                    if k == SpaceKind::Bs { "BS" } else { "CS" },
+                    c.name.replace('/', "_"),
+                    format!("--sat {} --tsid {tsid:04x}", c.freq_hz),
+                    c.name.clone(),
                 )
-            }),
-            None => None,
-        };
+            }
+        });
         let Some((kind, channel, args, ts)) = mapped else {
             skipped.push(format!(
                 "{what}: space {} channel {ch} is not in the ini",
@@ -389,12 +359,14 @@ fn render_logos(channels: &[Channel], dir: &str, have: impl Fn(u64) -> bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches;
-
     use super::*;
 
     const INI: &str = "[Tuner]\nCATV=0\n[BS]\nBS15/101=1318000,0x40F1,101\nbad=12,1\n\
                        BS15/102=1318000,0x40F1,102\n[CS110]\nND02/296=1613000,0x6020,296\n";
+
+    fn spaces(ini: &str) -> Vec<Space> {
+        BonDriver::from_ini(Path::new("d.ini"), ini).unwrap().spaces
+    }
 
     fn svc(name: &str, space: u32, channel: u32, sid: u16, enabled: bool) -> ch2::Service {
         ch2::Service {
@@ -416,17 +388,62 @@ mod tests {
     #[test]
     fn spaces_follow_the_bondriver() {
         let s = spaces(INI);
-        assert_eq!(s.len(), 3); // UHF, BS, CS110 (CATV off)
-        assert_eq!(s[0], Space::Uhf);
-        let Space::Satellite { bs: true, lines } = &s[1] else {
-            panic!("BS")
-        };
+        let kinds: Vec<_> = s.iter().map(|s| s.kind).collect();
+        use SpaceKind::*;
+        assert_eq!(kinds, [Uhf, Bs, Cs110], "CATV off");
         assert_eq!(
-            lines.len(),
+            s[1].channels.len(),
             2,
             "the line that does not parse is not a channel"
         );
-        assert_matches!(&s[2], Space::Satellite { bs: false, .. });
+        // An empty UHF= is on, as GetPrivateProfileInt reads it: a scan made with this
+        // ini numbers BS as space 1.
+        let s = spaces("[Tuner]\nUHF=\nCATV=0\n[BS]\nBS15/TS1=1318000,0x40F1\n");
+        let kinds: Vec<_> = s.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, [Uhf, Bs]);
+    }
+
+    #[test]
+    fn channels_of_a_channel_file() {
+        let dir = std::env::temp_dir().join(format!("dt295-mirakc-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("BonDriver_PT3-S.ChSet.txt"),
+            "$BS\t0\n$CS110\t1\n\
+             BS15/TS1\t0\t0\t7\t1\nBS15/TS0\t0\t1\t7\t16624\n\
+             ND02\t1\t0\t12\t0\nBS99\t1\t1\t99\t0\n",
+        )
+        .unwrap();
+        let ini = "[Tuner]\nChannelFile=BonDriver_PT3-S.ChSet.txt\n[BS]\nA=1049480\n";
+        let b = BonDriver::from_ini(&dir.join("BonDriver_DT295.ini"), ini);
+        fs::remove_dir_all(&dir).unwrap();
+        let mut services = [
+            svc("NHK BS", 0, 0, 101, true),
+            svc("BSx", 0, 1, 103, true),
+            svc("TBS1", 1, 0, 296, true),
+            svc("none", 1, 1, 1, true),
+        ];
+        services[0].tsid = 0x40F1;
+        services[2].tsid = 0x6020;
+        let (ch, skipped) = channels(&b.unwrap().spaces, &services);
+        let got: Vec<_> = ch
+            .iter()
+            .map(|c| (c.kind, c.channel.as_str(), c.args.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("BS", "BS15_TS1", "--sat 1318000000 --tsid 40f1"),
+                ("BS", "BS15_TS0", "--sat 1318000000 --tsid 40f0"),
+                ("CS", "ND02", "--sat 1613000000 --tsid 6020"),
+            ],
+            "a TS number takes the service's TSID"
+        );
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("BS99 is no channel to tune"),
+            "{skipped:?}"
+        );
     }
 
     #[test]

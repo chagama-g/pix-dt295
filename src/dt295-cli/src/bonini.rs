@@ -1,67 +1,64 @@
-//! A BonDriver_DT295 ini as the configuration of `dt295 capture` and `dt295 logo`,
-//! read the way the BonDriver reads it. `[Tuner]` gives the firmware, the unit
-//! (`DeviceSerial`, else `DeviceIndex`) and the state file: paths are relative to the
-//! ini's folder, and the state file is named after the ini unless `StateFile` says
-//! otherwise. The channels are the built-in UHF (`13ch`..`62ch`) and CATV
-//! (`C13ch`..`C63ch`) ones plus the `[BS]` / `[CS110]` lines. On Linux, where there is
-//! no DLL, a file of the same format is the configuration.
+//! A BonDriver_DT295 ini as the configuration of `dt295 capture`, `dt295 logo` and
+//! `dt295 mirakc-channels`, read with the BonDriver's own code: `[Tuner]` gives the
+//! firmware, the unit (`DeviceSerial`, else `DeviceIndex`) and the state file
+//! ([`dt295::bonini::Tuner`]: paths are relative to the ini's folder, and the state file
+//! is named after the ini unless `StateFile` says otherwise), and the tuning spaces are
+//! [`chan::ini_spaces`] (the built-in UHF `13ch`..`62ch` and CATV `C13ch`..`C63ch` plus
+//! the `[BS]` / `[CS110]` lines, or those of the `ChannelFile`), so a TVTest `.ch2` made
+//! with the ini numbers them the same. On Linux, where there is no DLL, a file of the
+//! same format is the configuration.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use dt295::chan::{self, SatLine};
+use dt295::bonini::{DeviceSel, Tuner};
+use dt295::chan::{self, Channel, NO_TSID, Space};
+use dt295::{System, profile};
 
 use crate::tuner::DeviceArgs;
-
-const DEFAULT_FW: &str = "mb86m01_assp_osec_idle.bin";
-const DEFAULT_TRC: &str = "mb86m01_assp_osec_trc_m_h.bin";
 
 /// What a BonDriver_DT295 ini says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BonDriver {
     pub ini: PathBuf,
-    pub serial: Option<String>,
-    pub index: Option<usize>,
-    pub fw: PathBuf,
-    pub trc: PathBuf,
-    /// The state file (with the link key the unit last used).
-    pub state: PathBuf,
-    /// The `[BS]` and `[CS110]` lines (name, value), in file order.
-    pub satellite: Vec<(String, String)>,
-}
-
-/// What a channel name stands for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tune {
-    /// ISDB-T at this frequency (Hz); the first TV service.
-    Terrestrial(u32),
-    Satellite(SatLine),
+    /// `[Tuner]`: the firmware, the unit, the state file (with the link key the unit last
+    /// used).
+    pub tuner: Tuner,
+    /// The tuning spaces, in the BonDriver's order.
+    pub spaces: Vec<Space>,
 }
 
 impl BonDriver {
-    pub fn from_ini(ini: &Path, text: &str) -> Self {
-        let folder = ini.parent().unwrap_or(Path::new("."));
-        let tuner = ini_section(text, "Tuner");
-        let value = |k: &str| tuner.get(k).map(String::as_str).filter(|v| !v.is_empty());
-        let mut satellite = ini_lines(text, "BS");
-        satellite.extend(ini_lines(text, "CS110"));
-        Self {
+    pub fn from_ini(ini: &Path, text: &str) -> Result<Self> {
+        let parsed =
+            profile::parse(text).with_context(|| format!("cannot parse {}", ini.display()))?;
+        let dir = ini.parent().unwrap_or(Path::new(""));
+        let tuner = Tuner::from_ini(&parsed, dir, &ini.with_extension(""));
+        // As the BonDriver: a ChannelFile that cannot be read gives no tuning spaces (the
+        // ini still names the unit and its state file, which `dt295 logo` needs).
+        let spaces = match chan::ini_spaces(&parsed, tuner.channel_file.as_deref()) {
+            Ok((spaces, log)) => {
+                for line in log {
+                    tracing::debug!("{line}");
+                }
+                spaces
+            }
+            Err(e) => {
+                tracing::warn!("{}: {e}; no tuning spaces", ini.display());
+                Vec::new()
+            }
+        };
+        Ok(Self {
             ini: ini.to_owned(),
-            serial: value("deviceserial").map(str::to_owned),
-            index: value("deviceindex").and_then(|v| usize::try_from(chan::strtol(v).0).ok()),
-            fw: folder.join(value("firmware").unwrap_or(DEFAULT_FW)),
-            trc: folder.join(value("trcfirmware").unwrap_or(DEFAULT_TRC)),
-            state: value("statefile")
-                .map_or_else(|| ini.with_extension("state"), |s| folder.join(s)),
-            satellite,
-        }
+            tuner,
+            spaces,
+        })
     }
 
     pub fn load(ini: &Path) -> Result<Self> {
         let bytes = fs::read(ini).with_context(|| format!("cannot read {}", ini.display()))?;
-        Ok(Self::from_ini(ini, &decode_ini(&bytes)))
+        Self::from_ini(ini, &profile::decode(&bytes))
     }
 
     /// The `BonDriver_DT295*.ini` files in a folder, by name.
@@ -84,122 +81,84 @@ impl BonDriver {
         Ok(out)
     }
 
+    /// The unit's serial number when the ini names one (`DeviceSerial`).
+    pub fn serial(&self) -> Option<&str> {
+        match &self.tuner.device {
+            DeviceSel::Serial(s) => Some(s),
+            DeviceSel::Index(_) => None,
+        }
+    }
+
     /// The device options this ini gives, with the ones given on the command line
-    /// winning (an explicit `-i` also wins over the ini's `DeviceSerial`).
+    /// winning (an explicit `-i` also wins over the ini's `DeviceSerial`). An empty
+    /// `TrcFirmware=` gives none: no stream can start, as in the BonDriver.
     pub fn device_args(&self, given: &DeviceArgs) -> DeviceArgs {
         let explicit_index = given.index != 0;
+        let index = match self.tuner.device {
+            DeviceSel::Index(n) => n,
+            DeviceSel::Serial(_) => 0,
+        };
         DeviceArgs {
-            fw: given.fw.clone().or_else(|| Some(self.fw.clone())),
-            trc: given.trc.clone().or_else(|| Some(self.trc.clone())),
-            index: if explicit_index {
-                given.index
-            } else {
-                self.index.unwrap_or(0)
-            },
+            fw: given
+                .fw
+                .clone()
+                .or_else(|| Some(self.tuner.firmware.clone())),
+            trc: given
+                .trc
+                .clone()
+                .or_else(|| self.tuner.trc_firmware.clone()),
+            index: if explicit_index { given.index } else { index },
             serial: given
                 .serial
                 .clone()
-                .or_else(|| (!explicit_index).then(|| self.serial.clone()).flatten()),
-            state: given.state.clone().or_else(|| Some(self.state.clone())),
+                .or_else(|| self.serial().filter(|_| !explicit_index).map(str::to_owned)),
+            state: given
+                .state
+                .clone()
+                .or_else(|| Some(self.tuner.state_file.clone())),
         }
     }
 }
 
-/// What a channel name stands for: one of the `[BS]` / `[CS110]` lines (names compare
-/// case-insensitively), else a built-in `NNch` (UHF) or `CNNch` (CATV) name.
-pub fn tune(name: &str, satellite: &[(String, String)]) -> Option<Tune> {
-    if let Some((_, v)) = satellite.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
-        return chan::satellite_line(v).map(Tune::Satellite);
+/// The channel a name stands for: a channel of one of the tuning spaces (names compare
+/// case-insensitively, the first one to tune wins), else a built-in `NNch` (UHF) or
+/// `CNNch` (CATV) name, also when the ini turns that space off or there is no ini.
+pub fn tune(name: &str, spaces: &[Space]) -> Option<Channel> {
+    let mut listed = spaces.iter().flat_map(|s| &s.channels);
+    if let Some(c) = listed.find(|c| c.untunable.is_none() && c.name.eq_ignore_ascii_case(name)) {
+        return Some(c.clone());
     }
-    let name = name.trim().to_ascii_lowercase();
-    let number = name.strip_suffix("ch")?;
+    let number = name.trim().to_ascii_lowercase();
+    let number = number.strip_suffix("ch")?;
     let hz = match number.strip_prefix('c') {
         Some(n) => chan::catv_hz(n.parse().ok()?),
         None => chan::uhf_hz(number.parse().ok()?),
     };
-    hz.map(Tune::Terrestrial)
+    Some(Channel {
+        name: name.to_owned(),
+        sys: System::Terrestrial,
+        freq_hz: hz?,
+        tsid: NO_TSID,
+        sid: None,
+        untunable: None,
+    })
 }
 
-/// An ini file's text as the BonDriver reads it: UTF-16 LE or UTF-8 with a BOM,
-/// UTF-8, else the ANSI code page.
-pub fn decode_ini(b: &[u8]) -> String {
-    if let Some(rest) = b.strip_prefix(b"\xFF\xFE") {
-        return String::from_utf16le_lossy(rest);
-    }
-    let b = b.trim_prefix(b"\xEF\xBB\xBF");
-    match std::str::from_utf8(b) {
-        Ok(s) => s.to_owned(),
-        Err(_) => decode_ansi(b),
-    }
-}
-
-#[cfg(windows)]
-fn decode_ansi(b: &[u8]) -> String {
-    use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-    let Ok(len) = i32::try_from(b.len()) else {
-        return String::from_utf8_lossy(b).into_owned();
-    };
-    if len == 0 {
-        return String::new();
-    }
-    // SAFETY: `len` readable bytes; a null output of size 0 only asks for the length.
-    let need = unsafe { MultiByteToWideChar(CP_ACP, 0, b.as_ptr(), len, std::ptr::null_mut(), 0) };
-    let mut w = vec![0u16; usize::try_from(need).unwrap_or(0)];
-    // SAFETY: as above, and `w` is writable for `need` UTF-16 units.
-    let got = unsafe { MultiByteToWideChar(CP_ACP, 0, b.as_ptr(), len, w.as_mut_ptr(), need) };
-    match usize::try_from(got) {
-        Ok(n) if n > 0 => String::from_utf16_lossy(&w[..n]),
-        _ => String::from_utf8_lossy(b).into_owned(),
-    }
-}
-
-#[cfg(not(windows))]
-fn decode_ansi(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
-}
-
-/// The name of a `[name]` section header; what follows the `]` is ignored, as the
-/// BonDriver (and the Win32 profile API) does.
-fn header(line: &str) -> Option<&str> {
-    let rest = line.trim_start().strip_prefix('[')?;
-    Some(rest[..rest.find(']')?].trim())
-}
-
-/// The `key=value` lines of one section (keys and values trimmed), in file order;
-/// `;` / `#` comments and lines without `=` are skipped.
-pub fn ini_lines(text: &str, section: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut inside = false;
-    for line in text.lines() {
-        if let Some(name) = header(line) {
-            inside = name.eq_ignore_ascii_case(section);
-            continue;
-        }
-        let line = line.trim();
-        if !inside || line.starts_with([';', '#']) {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            out.push((k.trim().to_owned(), v.trim().to_owned()));
-        }
-    }
-    out
-}
-
-/// The keys of one section, lower-cased, values without surrounding quotes; the first
-/// of repeated keys wins (as for the Win32 profile API).
-pub fn ini_section(text: &str, section: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for (k, v) in ini_lines(text, section) {
-        let v = v.strip_circumfix('"', '"').unwrap_or(&v).to_owned();
-        out.entry(k.to_ascii_lowercase()).or_insert(v);
-    }
-    out
+/// Why the channel of a name does not tune, when [`tune`] finds none: the first listed
+/// channel of that name is one of the placeholders (another modulation, left-hand, a
+/// number without a definition).
+pub fn untunable<'a>(name: &str, spaces: &'a [Space]) -> Option<&'a str> {
+    spaces
+        .iter()
+        .flat_map(|s| &s.channels)
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .and_then(|c| c.untunable.as_deref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dt295::chan::SpaceKind;
 
     const INI: &str = "[Tuner]\r\n\
         DeviceIndex=2\r\n\
@@ -215,54 +174,78 @@ mod tests {
         27ch=nothing\r\n";
 
     fn ini() -> BonDriver {
-        BonDriver::from_ini(&Path::new("cfg").join("dt295.ini"), INI)
+        BonDriver::from_ini(&Path::new("cfg").join("dt295.ini"), INI).unwrap()
+    }
+
+    fn kinds(b: &BonDriver) -> Vec<SpaceKind> {
+        b.spaces.iter().map(|s| s.kind).collect()
     }
 
     #[test]
     fn tuner_section() {
         let b = ini();
         let dir = Path::new("cfg");
-        assert_eq!((b.serial.as_deref(), b.index), (None, Some(2)));
-        assert_eq!(b.fw, dir.join("mb86m01_assp_osec_idle.bin"));
-        assert_eq!(b.trc, dir.join("fw\\trc.bin"));
-        assert_eq!(b.state, dir.join("dt295.state"));
-        assert_eq!(b.satellite.len(), 4);
+        assert_eq!((b.serial(), &b.tuner.device), (None, &DeviceSel::Index(2)));
+        assert_eq!(b.tuner.firmware, dir.join("mb86m01_assp_osec_idle.bin"));
+        assert_eq!(b.tuner.trc_firmware, Some(dir.join("fw\\trc.bin")));
+        assert_eq!(b.tuner.state_file, dir.join("dt295.state"));
+        use SpaceKind::*;
+        assert_eq!(kinds(&b), [Uhf, Catv, Bs, Cs110]);
+        assert_eq!(
+            b.spaces[2].channels.len(),
+            2,
+            "the line out of range is none"
+        );
+    }
+
+    #[test]
+    fn spaces_as_the_bondriver_lists_them() {
+        let b = |text: &str| BonDriver::from_ini(Path::new("d.ini"), text).unwrap();
+        use SpaceKind::*;
+        // GetPrivateProfileInt: an empty value is the default (on), as is no key.
+        assert_eq!(kinds(&b("[Tuner]\nUHF=\nCATV=0\n")), [Uhf]);
+        // Only the first [BS] section counts.
+        let two = b("[BS]\nA=1049480,0x4010\n[BS]\nB=1087840,0x4030\n");
+        let names: Vec<_> = two.spaces[2].channels.iter().map(|c| &c.name).collect();
+        assert_eq!(names, ["A"]);
+        // A ChannelFile that is not there: no spaces, but the ini still reads.
+        let gone = b("[Tuner]\nDeviceSerial=WI01\nChannelFile=missing.ChSet.txt\n");
+        assert_eq!((gone.serial(), gone.spaces.len()), (Some("WI01"), 0));
     }
 
     #[test]
     fn channel_names() {
         let b = ini();
-        let sat = |hz, tsid, sid| {
-            Some(Tune::Satellite(SatLine {
-                freq_hz: hz,
-                tsid,
-                sid,
-            }))
-        };
+        let tuned = |name: &str| tune(name, &b.spaces).map(|c| (c.sys, c.freq_hz, c.tsid, c.sid));
+        let sat = |hz, tsid, sid| Some((System::Satellite, hz, tsid, sid));
+        let ter = |hz| Some((System::Terrestrial, hz, NO_TSID, None));
+        assert_eq!(tuned("BS15/101"), sat(1_318_000_000, 0x40F1, Some(101)));
+        assert_eq!(tuned("bs01/151"), sat(1_049_480_000, 0x4010, None));
+        assert_eq!(tuned("ND02/296"), sat(1_613_000_000, 0x6020, Some(296)));
+        assert_eq!(tuned("Bad"), None, "IF out of range");
+        assert_eq!(tuned("27ch"), ter(557_142_857));
+        assert_eq!(tuned("C13CH"), ter(111_142_857));
+        assert_eq!(tuned("12ch"), None);
+        assert_eq!(tuned("BS99/1"), None);
         assert_eq!(
-            tune("BS15/101", &b.satellite),
-            sat(1_318_000_000, 0x40F1, Some(101))
+            tune(" 62ch", &[]).map(|c| (c.sys, c.freq_hz)),
+            Some((System::Terrestrial, 767_142_857)),
+            "built in without an ini"
         );
-        assert_eq!(
-            tune("bs01/151", &b.satellite),
-            sat(1_049_480_000, 0x4010, None)
-        );
-        assert_eq!(
-            tune("ND02/296", &b.satellite),
-            sat(1_613_000_000, 0x6020, Some(296))
-        );
-        assert_eq!(tune("Bad", &b.satellite), None, "IF out of range");
-        assert_eq!(
-            tune("27ch", &b.satellite),
-            Some(Tune::Terrestrial(557_142_857))
-        );
-        assert_eq!(
-            tune("C13CH", &b.satellite),
-            Some(Tune::Terrestrial(111_142_857))
-        );
-        assert_eq!(tune("12ch", &b.satellite), None);
-        assert_eq!(tune("BS99/1", &b.satellite), None);
-        assert_eq!(tune("62ch", &[]), Some(Tune::Terrestrial(767_142_857)));
+        // why a placeholder of a channel file does not tune; none for a channel that
+        // tunes or is not there
+        let file = [Space {
+            name: "S".into(),
+            kind: SpaceKind::File,
+            channels: vec![Channel {
+                untunable: Some("left-hand".into()),
+                ..tune("BS15/101", &b.spaces).unwrap()
+            }],
+        }];
+        assert_eq!(tune("bs15/101", &file), None);
+        assert_eq!(untunable("bs15/101", &file), Some("left-hand"));
+        assert_eq!(untunable("BS15/101", &b.spaces), None);
+        assert_eq!(untunable("BS99/1", &b.spaces), None);
     }
 
     #[test]
@@ -270,7 +253,8 @@ mod tests {
         let b = BonDriver::from_ini(
             Path::new("dt295.ini"),
             "[Tuner]\nDeviceSerial=EF34567890\nStateFile=s.state\n",
-        );
+        )
+        .unwrap();
         let none = DeviceArgs {
             fw: None,
             trc: None,
@@ -296,14 +280,25 @@ mod tests {
     }
 
     #[test]
-    fn sections_and_text() {
-        let t = "[A]\nk=1\nK=2\n# c\n;x=1\nnoeq\n[ b ] tail\nv = \"q\" \n";
-        assert_eq!(ini_section(t, "a").get("k").map(String::as_str), Some("1"));
-        assert_eq!(ini_section(t, "B").get("v").map(String::as_str), Some("q"));
-        assert_eq!(ini_lines(t, "A").len(), 2);
-        assert_eq!(decode_ini(b"\xEF\xBB\xBF[T]"), "[T]");
-        assert_eq!(decode_ini(b"\xFF\xFE[\0T\0]\0"), "[T]");
-        // not UTF-8: the ANSI code page; never fails
-        assert!(decode_ini(b"[T]\r\nA=\x82\xA0").starts_with("[T]\r\nA="));
+    fn tuner_keys_as_the_bondriver_reads_them() {
+        let b = |text: &str| BonDriver::from_ini(Path::new("d.ini"), text).unwrap();
+        let none = DeviceArgs {
+            fw: None,
+            trc: None,
+            index: 0,
+            serial: None,
+            state: None,
+        };
+        // An empty TrcFirmware= is none (no stream can start), not the default file.
+        assert_eq!(b("[Tuner]\nTrcFirmware=\n").device_args(&none).trc, None);
+        // DeviceIndex as GetPrivateProfileInt: 010 is ten, a negative one opens nothing.
+        assert_eq!(b("[Tuner]\nDeviceIndex=010\n").device_args(&none).index, 10);
+        assert_eq!(
+            b("[Tuner]\nDeviceIndex=-1\n").device_args(&none).index,
+            usize::MAX
+        );
+        // DeviceSerial: blanks trimmed (inside quotes too), upper case.
+        let d = b("[Tuner]\nDeviceSerial=\" ef34567890 \"\n").device_args(&none);
+        assert_eq!(d.serial.as_deref(), Some("EF34567890"));
     }
 }

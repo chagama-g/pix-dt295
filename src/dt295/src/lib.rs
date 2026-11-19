@@ -7,7 +7,9 @@
 //! * [`ts`] -- pure TS / PSI logic (CRC, PAT checks, link decryption, the
 //!   satellite PSI keeper, stream statistics); no device I/O, unit-tested.
 //! * [`state`] -- the host's persistent state file (link key, PSI).
-//! * [`chan`] -- the built-in ISDB-T channel tables and the satellite ini line.
+//! * [`chan`] -- the built-in ISDB-T channel tables, the satellite ini line and the
+//!   tuning spaces of a BonDriver ini; [`bonini`] -- its `[Tuner]`; [`profile`] -- the
+//!   Win32 profile API's reading of an ini file.
 //! * [`CardWatch`] -- when a host should start a stream over for the B-CAS card;
 //!   [`StallWatch`] -- for a firmware that stopped acking.
 //!
@@ -30,7 +32,8 @@ mod s1;
 mod watch;
 
 pub use device::{Device, KeyJournal, Live};
-pub use dt295_core::{Error, Result, Status, System, TsSink, chan, error};
+pub use dt295_core::fwdl::{IDLE_FIRMWARE, TRC_FIRMWARE};
+pub use dt295_core::{Error, Result, Status, System, TsSink, bonini, chan, error, profile};
 pub use dt295_rawfw::{RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, RawCaptureStats, raw_stall_due};
 pub use dt295_usb::Listed;
 pub use watch::{CardWatch, StallWatch, StartOver};

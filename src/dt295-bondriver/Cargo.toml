@@ -15,17 +15,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 dt295.workspace = true
-rust-ini.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# + GetLocalTime (log stamps) and MultiByteToWideChar (an ANSI ini file).
-windows-sys = { workspace = true, features = [
-    "Win32_System_SystemInformation",
-    "Win32_Globalization",
-] }
+# + GetLocalTime (log stamps).
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }
 
 [build-dependencies]
 cc.workspace = true

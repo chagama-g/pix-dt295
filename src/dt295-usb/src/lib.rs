@@ -108,7 +108,9 @@ impl Device {
     /// Open the `index`-th (0-based) device matching `vid`/`pid`. On Windows the index
     /// counts only the devices this process can open: one in use by another process
     /// (or not bound to WinUSB) is skipped, so with several units the numbers shift --
-    /// select by serial number there ([`Device::open_serial`]).
+    /// select by serial number there ([`Device::open_serial`]). On Linux the index counts
+    /// the free units the same way. When there are not that many, [`Error::Access`] if one
+    /// was skipped (it may be free in a moment), else [`Error::NoDevice`].
     pub fn open(vid: u16, pid: u16, index: usize) -> Result<Self> {
         Ok(Self {
             inner: backend::Device::open(vid, pid, index)?,

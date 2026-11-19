@@ -13,8 +13,8 @@ use tracing::{info, warn};
 
 use crate::auth::{Block, cbc0_decrypt, nonce, t8_raw};
 use crate::cas::rpc_block;
-use dt295_core::proto::Io;
 use crate::{Error, Result};
+use dt295_core::proto::Io;
 
 /// The 07/01/06 request carrying `nonce4`.
 fn key_request(ss: &[u8; 16], nonce4: [u8; 4]) -> Result<Block> {

@@ -33,8 +33,9 @@ pub struct TuneArgs {
     #[arg(long, value_name = "HZ", value_parser = parse_u32)]
     pub sat: Option<u32>,
 
-    /// ISDB-S: the broadcast transport_stream_id in hex (e.g. 40f1 or 0x40F1);
-    /// default: the frequency's first TS.
+    /// ISDB-S: the broadcast transport_stream_id in hex (e.g. 40f1 or 0x40F1); 7 or
+    /// less is a TS number, the TS whose TSID has those low 3 bits; default: the
+    /// frequency's first TS.
     #[arg(long, value_name = "HEX", value_parser = parse_hex_u16, requires = "sat")]
     pub tsid: Option<u16>,
 

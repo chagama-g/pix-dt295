@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use dt295::{IDLE_FIRMWARE, TRC_FIRMWARE};
 use ini::Ini;
 
 /// Where `dt295 serve` reads its configuration by default.
@@ -31,9 +32,6 @@ pub const DEFAULT_CONF: &str = "/etc/dt295.conf";
 pub const DEFAULT_SOCKET: &str = "/run/dt295/dt295.sock";
 const DEFAULT_FIRMWARE_DIR: &str = "/usr/lib/firmware/dt295";
 const DEFAULT_STATE_DIR: &str = "/var/lib/dt295";
-/// The idle and transcoder firmware images, under the vendor's names.
-const IDLE_FIRMWARE: &str = "mb86m01_assp_osec_idle.bin";
-const TRC_FIRMWARE: &str = "mb86m01_assp_osec_trc_m_h.bin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conf {
@@ -86,7 +84,11 @@ impl Conf {
                     }
                 }
                 [kind, serial] if kind.eq_ignore_ascii_case("unit") => {
-                    if conf.units.iter().any(|u| u.serial.eq_ignore_ascii_case(serial)) {
+                    if conf
+                        .units
+                        .iter()
+                        .any(|u| u.serial.eq_ignore_ascii_case(serial))
+                    {
                         bail!("[unit {serial}] appears twice");
                     }
                     let mut raw_ts = false;
@@ -161,7 +163,10 @@ mod tests {
         assert_eq!(c.firmware_dir, Path::new(DEFAULT_FIRMWARE_DIR));
         assert_eq!(c.socket, Path::new(DEFAULT_SOCKET));
         assert_eq!(
-            c.units.iter().map(|u| u.serial.as_str()).collect::<Vec<_>>(),
+            c.units
+                .iter()
+                .map(|u| u.serial.as_str())
+                .collect::<Vec<_>>(),
             ["AB12345678", "cd23456789"]
         );
         assert!(c.units.iter().all(|u| !u.raw_ts), "default off");

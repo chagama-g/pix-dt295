@@ -26,6 +26,7 @@ BonDriver と ini、`dt295` の各コマンド、Linux のデーモンの設定�
 DLL と同じフォルダーに、同じ名前 (拡張子だけ `.ini`) で置く。
 無ければ既定値で動く。
 相対パスは DLL のフォルダーが基準。
+文字コードは UTF-8 (BOM の有無は問わない) か BOM 付きの UTF-16LE で、どちらでもなければ Shift_JIS として読む (Windows ではシステムの ANSI コードページ。Linux の `dt295` も同じく Shift_JIS)。
 見本は `src/dt295-bondriver/BonDriver_DT295.ini`。
 
 | キー | 既定 | 内容 |
@@ -36,10 +37,11 @@ DLL と同じフォルダーに、同じ名前 (拡張子だけ `.ini`) で置�
 | `[Tuner] DeviceIndex` | 0 | 複数台のときに使う個体の番号 (0 から)。開ける個体 (WinUSB で、ほかのプログラムが使っていない個体) のみを数えるので、片方が使用中だと番号がずれる |
 | `[Tuner] DeviceSerial` | なし | 使う個体の USB シリアル番号 (例 `CD23456789`。大文字小文字は区別しない)。`DeviceIndex` より優先し、つないだ順番に関係なくその個体を使用。`dt295 list` で確認可能 (1 台ずつ挿して確認し、本体にラベルを貼っておくとよい)。デバイス マネージャーの「デバイス インスタンス パス」 (`USB\VID_06B8&PID_103B\<シリアル番号>`) の末尾でも可 |
 | `[Tuner] UHF` / `CATV` | 1 / 1 | 地デジのチューニング空間 (UHF 13-62ch, CATV C13-C63) を表示するか |
+| `[Tuner] ChannelFile` | なし | ほかの BonDriver のチャンネル定義ファイル。指定すると、そのファイルのチューニング空間のみを、そのドライバーと同じ番号で表示 (`UHF` / `CATV` と `[BS]` / `[CS110]` は使わない)。下の "ほかの BonDriver のチャンネル定義" セクション |
 | `[Tuner] LogFile` | 0 | `1` で DLL と同じ名前の `.log` にログを出力。前回の分は `.log.1` に保存。ログは DebugView (`OutputDebugString`) にも常に出力 |
 | `[Tuner] LogLevel` | `info` | ログの詳しさ: `error`, `warn`, `info`, `debug`, `trace` (大文字小文字は区別しない)。ほかの値なら `info` とし、その旨をログに出力 |
 | `[Tuner] StateFile` | DLL と同じ名前の `.state` | 状態ファイル (デバイスのリンク鍵と衛星の PSI を保存)。空か行が無ければ DLL と同じ名前。無効化は不可 (無いと再オープンで復号できず、未契約のチャンネルがスキャンから漏れる)。消すと自動で再作成 |
-| `[BS]` / `[CS110]` | なし | `名前=周波数 (kHz),TSID[,ServiceID]` を 1 行に 1 チャンネル。周波数は IF (衛星の周波数 - 10678 MHz), TSID は放送の transport_stream_id (16 進は `0x` を付ける)。`ServiceID` を省くか -1 にすると、その TS の全サービス。1 行も無ければその空間は非表示 |
+| `[BS]` / `[CS110]` | なし | `名前=周波数 (kHz),TSID[,ServiceID]` を 1 行に 1 チャンネル。周波数は IF (衛星の周波数 - 10678 MHz), TSID は放送の transport_stream_id (16 進は `0x` を付ける。7 以下なら TS 番号で、TSID の下位 3 ビットがその値の TS)。`ServiceID` を省くか -1 にすると、その TS の全サービス。1 行も無ければその空間は非表示 |
 
 組み込みの周波数 (ISDB-T の中心周波数 = 帯域の中心 + 1/7 MHz。純正の表と同じ):
 - UHF 13-62ch: 473.142857 + (n-13)*6 MHz
@@ -56,6 +58,26 @@ raw-TS モード (`RawTS=1`) は、スクランブルされたままの TS を T
 最初の選局だけ cold の個体が必要で、そのあと TVTest を閉じて開き直すだけなら差し直しは要らない。
 通常モード (System1, 内蔵リーダーで解除) と raw-TS モードは `RawTS` だけで切り替わる。
 内部の仕組みと機能差は [raw-ts.md](raw-ts.md)。
+
+### ほかの BonDriver のチャンネル定義
+
+`[Tuner] ChannelFile` に、ほかの BonDriver のチャンネル定義ファイルを指定すると、そのまま読む。
+チューニング空間とチャンネルの番号がそのドライバーと同じになるので、そのドライバーで作った TVTest の `.ch2` や EDCB のチャンネル設定をそのまま使える。
+相対パスは DLL のフォルダーが基準 (`dt295` コマンドでは ini のフォルダー)。
+文字コードは ini と同じ扱い (ただし ChSet.txt は、PT のドライバーと同じく、Windows でも ANSI コードページによらず Shift_JIS として読む)。
+読めなければチューニング空間を 1 つも出さず、ログに理由を出力する。
+
+| 書式 | ファイルの例 | 読む内容 |
+|---|---|---|
+| BonDriver_BDA | `BonDriver_BDA.ini` | `[TuningSpace00]` から `[TuningSpace99]` (`[TuningSpace00]` が無ければ `[Channel]` が空間 0) の `TuningSpaceName`, `CHnnn`, `ChannelSettingsAuto` と `ChannelSettingsAutoOptions`, `ChannelGenerateN`, `FrequencyOffset`, `ReserveUnusedCh`。衛星の局発周波数は `[Satellite]`、変調方式は `[Modulation]` と `[Tuner] DefaultNetwork` から |
+| PT3-ST など (BonDriver_PTx-ST_mod, px4_drv の BonDriver_PX4 も) | `BonDriver_PT3-S.ChSet.txt` | `$` で始まる空間の行と、チャンネルの行 (空間, チャンネル, PTx のチャンネル, TSID)。BonDriver_PTx-ST_mod の `-` / `+` と、周波数の微調整 (`36-1` など) にも対応。地デジ用か衛星用かは、PT が DLL の名前で決めるのと同じく、ファイル名の最初の `-` (`BonDriver_PT3-` などの `-`) の次が `T` なら地デジ用 (`BonDriver_PT3-T.ChSet.txt` など)、それ以外は衛星用 |
+| BonDriver_PX シリーズ | `BonDriver_PX_W3PE_S0.ini` | `[BS]` / `[CS110]` の `CHANNEL_NUM` と `CHnnn` (`名前,サービス ID,周波数 (kHz),TSID`) |
+
+- 選局するのは ISDB-T と、ISDB-S (BS / CS110 の右旋) のチャンネルのみ。
+  ほかの変調方式 (DVB-S, QAM など)、左旋、定義の無い番号は、番号がずれないよう一覧に残し、選ぶと失敗してログに理由を出力する。
+- TSID が 7 以下なら TS 番号で、TSID の下位 3 ビットがその値の TS を選ぶ (BonDriver_PTx-ST_mod と同じ解釈。BonDriver_BDA の CS110 の見本の `0x0` もこれ)
+- サービス ID の欄は使わず、TS の全サービスを出力
+- `dt295 lineup` で作る `[BS]` / `[CS110]` の行は使われない
 
 ## `dt295` コマンド
 
@@ -100,19 +122,27 @@ Windows では WinUSB になっていない個体も, Linux ではデーモン�
 dt295 capture --fw mb86m01_assp_osec_idle.bin --trc mb86m01_assp_osec_trc_m_h.bin --ter 557142857 -t 10 -o ter.ts
 dt295 capture --fw mb86m01_assp_osec_idle.bin --trc mb86m01_assp_osec_trc_m_h.bin --sat 1049480000 --tsid 4010 --sid 151 -o bs.ts
 dt295 capture --bondriver BonDriver_DT295.ini --channel BS15/TS1 -t 0 > bs.ts
+dt295 capture --raw-ts --serial CD23456789 --channel 27ch -t 60 -o raw.ts
 ```
 
 - 地デジは `--ter <Hz>`, 衛星は `--sat <IF の Hz>` と `--tsid <16 進>`。
-  `--tsid` を省くとその周波数の最初の TS、`--sid` を省くとその TS の全サービス。
+  `--tsid` を省くとその周波数の最初の TS、7 以下なら TS 番号 (TSID の下位 3 ビットがその値の TS)、`--sid` を省くとその TS の全サービス。
 - `--all-services` は、`--channel` の行に `ServiceID` があっても TS の全サービスを出力
 - `-t` は秒数 (既定 10)、`-t 0` は止めるまで続ける。
   どの方法で止めても、ストリームを停止し、リンク鍵を状態ファイルに保存してから終了する。
   SIGKILL で強制終了されても、個体に残ったストリームは次の起動時に停止される。
 - `-o` を省くと標準出力へ書き出し (端末には出力しない)
+- 出力先 (ファイルや読み手のパイプ) が数秒以上止まると、その間の TS は捨て、終了時に `bytes dropped` として表示する (止まった出力をストリームが待つと、どちらのモードでも TS が途切れるため)
 - `--bondriver <ini>` は BonDriver の ini からファームウェア, 個体, 状態ファイルを読み取り、コマンドラインでの指定が優先される。
   Linux でも同じ形式の ini を設定ファイルとして使える。
-- `--channel <名前>` は、`--bondriver` の ini の行の名前 (例 `BS15/TS1`), 地デジの `27ch`, CATV の `C13ch`。
+- `--raw-ts` は raw-TS モードで取り込む。
+  純正ファームウェアも状態ファイルも使わず (`--fw`, `--trc`, `--state`, `--sid` は指定するとエラー)、スクランブルされた TS の全サービスをそのまま出力するので、B-CAS の解除は受け取る側で行う。
+  `RawTS=1` の ini と、`-c` の設定で `raw-ts = true` の個体は、指定しなくても raw-TS モードになる。
+  差したての個体の最初の選局はチップの立ち上げを含み、それ以降は別のプロセスからでも選局のみ (最初の TS まで 2 秒ほど)。
+  差してから一度でも純正ファームウェアで起動した個体 (通常モードの TVTest や `dt295 capture` で使った個体) は、抜き差しするまで raw-TS で使えない。
+- `--channel <名前>` は、`--bondriver` の ini のチャンネル (`[BS]` / `[CS110]` の行か `ChannelFile` のチャンネル) の名前 (例 `BS15/TS1`), 地デジの `27ch`, CATV の `C13ch`。
   大文字小文字は区別しない。
+  `ChannelFile` の選局できないチャンネル (DVB-S や左旋など) の名前は、理由を表示してエラー。
 - `--state <ファイル>` は、その状態ファイルのリンク鍵を使い、検証できた鍵を書き戻す。
   TVTest と交互に使うときは、BonDriver の `.state` を渡す (下の "困ったとき" セクション)。
 - Linux でデーモンの個体を使うときは、デーモンを止めてから `-c /etc/dt295.conf` を指定 (リンク鍵が引き継がれる)
@@ -139,7 +169,7 @@ dt295 lineup BonDriver_DT295.state --bondriver BonDriver_DT295.ini --write  # in
 - 状態ファイルに溜まった SDT から、TV, 音声のみ, データ放送のサービスのある TS を 1 TS 1 行で出力する。
   `--per-service` を付けると、1 サービス 1 行 (`ServiceID` 付き)。
   SDT は TVTest で BS / CS を視聴したりスキャンしたりすると溜まるので、ひととおり視聴してから使う。
-- 行の上のコメントのサービス名は、状態ファイルと同じ名前の `.ch2` から取得 (`--ch2 <ファイル>` で指定、`--ch2 -` で使わない)
+- 行の上のコメントのサービス名は、`--bondriver` の ini と同じ名前の `.ch2` (無ければ状態ファイルと同じ名前の `.ch2`) から取得 (`--ch2 <ファイル>` で指定、`--ch2 -` で使わない)
 - 書き換えると空になるセクションがあるときは、`--write` でも書き換えない
 - 終了コードは diff と同様で、0 は成功、1 は空になるセクションがある、2 は入力や ini の誤り
 
@@ -184,6 +214,8 @@ dt295 logo --unschedule                                 # 毎日の実行を解�
 
 - 個体, ファームウェア, 状態ファイルは、TVTest の BonDriver のフォルダーにある `BonDriver_DT295*.ini` から読み取る。
   視聴中の個体は使わない。
+  `RawTS=1` の ini の個体は、BonDriver と同じく純正ファームウェアを使わずに raw-TS で受信する (状態ファイルも使わないので、そのまま raw-TS の TVTest で使える)。
+  `TrcFirmware=` が空の ini (raw-TS でないもの) の個体はストリームを始められないので、エラーで終了する。
   `DeviceSerial` の個体が空いていなければ、ほかの空いている個体を状態ファイル無しで使う (直前に別のソフトが使っていた個体だと復号できないことがある)。
   `--serial <シリアル番号>` でその個体のみを使う。
 - 待つのは最長 `--wait <分>` (既定 45) で、空いた個体が無ければ空くのを待ち、受信に失敗したら再試行
@@ -377,6 +409,12 @@ bontest C:\TVTest\BonDriver\BonDriver_DT295.dll 0 14 8 [out.ts]
 # 1 回開いたまま空間 (と範囲) を順に選局し、1 チャンネルごとの所要時間を表示 (TVTest のスキャンと同じ呼び方。PSI は待たない)
 # <空間>[:<最初>[-<最後>]] を並べる。例: CS110 の 1 つ目、BS の 1 つ目、UHF 全部
 bontest C:\TVTest\BonDriver\BonDriver_DT295.dll scan 3:0 2:0 0
+
+# チャンネルを選ばずに 60 秒開いたままにする (その間の keepalive や抜き差しの扱いはログで確認)
+bontest C:\TVTest\BonDriver\BonDriver_DT295.dll idle 60
+
+# 27ch を 10 秒受信して閉じ、90 秒後に DLL を読み込んだまま同じことをもう一度 (DLL を読み込んだままにするソフトの動き)
+bontest C:\TVTest\BonDriver\BonDriver_DT295.dll reopen 0 14 10 90
 ```
 
 DLL の ini、状態ファイル、ログがそのまま使われる。

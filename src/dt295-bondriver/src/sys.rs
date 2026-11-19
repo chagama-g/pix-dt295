@@ -1,6 +1,6 @@
-//! The few OS services the driver needs: its own module path, OutputDebugString,
-//! local time and the ANSI code page. Windows only in practice; other targets get
-//! stand-ins so the pure parts of the crate build and test anywhere.
+//! The few OS services the driver needs: its own module path, OutputDebugString and
+//! local time. Windows only in practice; other targets get stand-ins so the pure
+//! parts of the crate build and test anywhere.
 
 use std::ffi::OsString;
 
@@ -21,7 +21,6 @@ mod imp {
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{HMODULE, SYSTEMTIME};
-    use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
     use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
     use windows_sys::Win32::System::LibraryLoader::{
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -93,30 +92,6 @@ mod imp {
             millis: t.wMilliseconds,
         }
     }
-
-    pub fn decode_ansi(bytes: &[u8]) -> String {
-        let Ok(len) = i32::try_from(bytes.len()) else {
-            return String::from_utf8_lossy(bytes).into_owned();
-        };
-        if len == 0 {
-            return String::new();
-        }
-        // SAFETY: the input is `len` readable bytes; a null output with size 0
-        // only asks for the required length.
-        let need =
-            unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, ptr::null_mut(), 0) };
-        let Ok(cap) = usize::try_from(need) else {
-            return String::from_utf8_lossy(bytes).into_owned();
-        };
-        let mut w = vec![0u16; cap];
-        // SAFETY: as above, and `w` is writable for `need` UTF-16 units.
-        let got =
-            unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, w.as_mut_ptr(), need) };
-        match usize::try_from(got) {
-            Ok(n) if n > 0 => String::from_utf16_lossy(&w[..n]),
-            _ => String::from_utf8_lossy(bytes).into_owned(),
-        }
-    }
 }
 
 #[cfg(not(windows))]
@@ -144,10 +119,6 @@ mod imp {
             millis: d.subsec_millis() as u16,
         }
     }
-
-    pub fn decode_ansi(bytes: &[u8]) -> String {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
 }
 
 /// Full path of the module (DLL) this code is in; `None` if unknown.
@@ -163,12 +134,6 @@ pub fn output_debug_string(s: &str) {
 /// Local time of day.
 pub fn local_time() -> TimeOfDay {
     imp::local_time()
-}
-
-/// Decode bytes in the system ANSI code page (what the Win32 profile API assumes for
-/// a BOM-less ini file).
-pub fn decode_ansi(bytes: &[u8]) -> String {
-    imp::decode_ansi(bytes)
 }
 
 #[cfg(test)]
@@ -189,11 +154,5 @@ mod tests {
             std::path::PathBuf::from(p).canonicalize().unwrap(),
             std::env::current_exe().unwrap().canonicalize().unwrap()
         );
-    }
-
-    #[test]
-    fn ansi_ascii() {
-        assert_eq!(decode_ansi(b"[Tuner]\r\nUHF=1"), "[Tuner]\r\nUHF=1");
-        assert_eq!(decode_ansi(b""), "");
     }
 }

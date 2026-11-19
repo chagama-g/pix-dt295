@@ -1,6 +1,6 @@
 //! What `dt295 capture`, `dt295 logo` and `dt295 serve` share: the device options,
 //! opening and booting a unit, waiting for lock, Ctrl-C, and carrying the link key in
-//! the state file.
+//! the state file (by the rules of [`dt295::state`]).
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use dt295::state::State;
-use dt295::{Device, KeyJournal, System};
+use dt295::bonini::DeviceSel;
+use dt295::state::{State, key_journal};
+use dt295::{Device, System};
 
 /// Which unit to open and the firmware to boot it with.
 #[derive(Debug, Clone, Args)]
@@ -97,43 +98,19 @@ pub fn install_ctrl_c() {
 #[cfg(not(any(windows, unix)))]
 pub fn install_ctrl_c() {}
 
-/// The keys a state file offers the device, in the order to try them: the one a
-/// stream proved, then the unproved ones.
-pub fn prior_keys(st: &State) -> Vec<[u8; 16]> {
-    st.link_key
-        .into_iter()
-        .chain(st.pending_keys.iter().copied())
-        .collect()
-}
-
-/// Keep each key the device hands out in the state file at once, unproved; `written`
-/// is set when one was. A key handed out after the secure session lapsed is the
-/// applied one, and a recorder may SIGKILL the process before a stream proves it:
-/// then only the file still knows it.
-pub fn key_journal(path: PathBuf, written: Arc<AtomicBool>) -> KeyJournal {
-    Box::new(move |key| {
-        let mut st = State::load(&path).ok().flatten().unwrap_or_default();
-        st.add_pending_key(key);
-        if st.save(&path).is_ok() {
-            written.store(true, Ordering::Relaxed);
-        }
-    })
-}
-
-/// Take the link key a stream proved into `st`; the unproved keys give way to the one
-/// the device handed out at its last start, while that is not the proved one (the
-/// device may still switch to it). Whether `st` changed.
-pub fn take_link_keys(st: &mut State, dev: &Device) -> bool {
-    let Some(key) = dev.link_key() else {
-        return false;
+/// Open the unit `--serial`, else `-i`, without booting anything (the raw-TS path boots
+/// no firmware), trying again for a moment while it cannot be opened, as the BonDriver
+/// does ([`Device::open_sel`]).
+pub fn open_device(a: &DeviceArgs) -> Result<Device> {
+    let sel = match &a.serial {
+        Some(s) => DeviceSel::Serial(s.clone()),
+        None => DeviceSel::Index(a.index),
     };
-    let unproved: Vec<[u8; 16]> = dev.unproved_link_key().into_iter().collect();
-    if st.link_key == Some(key) && st.pending_keys == unproved {
-        return false;
+    let dev = Device::open_sel(&sel).with_context(|| format!("open device ({sel})"))?;
+    if let Some(s) = dev.serial() {
+        tracing::info!("device serial {s}");
     }
-    st.link_key = Some(key);
-    st.pending_keys = unproved;
-    true
+    Ok(dev)
 }
 
 /// An open, booted unit and the state file it takes its link key from.
@@ -158,20 +135,14 @@ impl Unit {
         let state = match &a.state {
             Some(p) => Some((
                 p.clone(),
-                State::load(p)
+                State::load_settled(p)
                     .with_context(|| format!("cannot read {}", p.display()))?
                     .unwrap_or_default(),
             )),
             None => None,
         };
 
-        let mut dev = match &a.serial {
-            Some(s) => Device::open_serial(s).with_context(|| format!("open device serial {s}"))?,
-            None => Device::open(a.index).with_context(|| format!("open device {}", a.index))?,
-        };
-        if let Some(s) = dev.serial() {
-            tracing::info!("device serial {s}");
-        }
+        let mut dev = open_device(a)?;
         // --trc selects the System1 (EP 0x81) viewing path. Set it BEFORE start: the
         // front-end power-on sequence depends on it.
         if let Some(trc) = &a.trc {
@@ -179,7 +150,7 @@ impl Unit {
         }
         let pending_written = Arc::new(AtomicBool::new(false));
         if let Some((path, st)) = &state {
-            let keys = prior_keys(st);
+            let keys = st.prior_keys();
             if !keys.is_empty() {
                 dev.set_prior_link_keys(&keys);
             }
@@ -259,7 +230,8 @@ impl Unit {
             return;
         }
         let pending = self.pending_written.swap(false, Ordering::Relaxed);
-        if take_link_keys(st, &self.dev) || pending {
+        let taken = st.take_link_keys(self.dev.link_key(), self.dev.unproved_link_key());
+        if taken || pending {
             match st.save(p) {
                 Ok(()) => eprintln!(
                     "link key: saved the key this stream proved to {}",

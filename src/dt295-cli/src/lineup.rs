@@ -18,6 +18,7 @@ use std::process::ExitCode;
 
 use clap::{Args, ValueEnum};
 use dt295::PsiRecord;
+use dt295::chan::{LNB_LO_KHZ, Transponder, rel_ts, transponder};
 use dt295::state::State;
 use dt295::ts::crc::section_crc_ok;
 use dt295::ts::section::descriptors;
@@ -39,15 +40,6 @@ const LISTED_TYPES: [u8; 4] = [0x01, 0x02, 0xAD, 0xC0];
 /// Promo: a channel scan skips one whose PMT never arrives, so off unless `--promo`.
 const PROMO_TYPE: u8 = 0xA5;
 
-/// BS / CS110 LNB local oscillator.
-const LNB_LO_KHZ: u32 = 10_678_000;
-/// IF of BS-1 and the step per odd transponder.
-const BS_IF_BASE: u32 = 1_049_480;
-const BS_IF_STEP: u32 = 38_360;
-/// IF of ND02 and the step per even ND.
-const CS_IF_BASE: u32 = 1_613_000;
-const CS_IF_STEP: u32 = 40_000;
-
 const STATE_MAGIC: &str = "dt295-state";
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
@@ -57,8 +49,8 @@ pub struct LineupArgs {
     /// A state file (BonDriver_DT295.state, or dt295 serve's <serial>.state).
     pub state: PathBuf,
 
-    /// Channel file with the service names for the comments (default: STATE with
-    /// the extension .ch2, if present; `-` = none).
+    /// Channel file with the service names for the comments (default: the --bondriver
+    /// ini's name with the extension .ch2, else STATE's, the first present; `-` = none).
     #[arg(long, value_name = "FILE")]
     pub ch2: Option<PathBuf>,
 
@@ -127,7 +119,7 @@ fn execute(args: &LineupArgs, today: u32, out: &mut dyn Write, err: &mut dyn Wri
     let ch2 = match &args.ch2 {
         Some(p) if p.as_os_str() == "-" => None,
         Some(p) => Some(p.clone()),
-        None => Some(args.state.with_extension("ch2")).filter(|p| p.is_file()),
+        None => default_ch2(&args.state, args.bondriver.as_deref()),
     };
     let names = match &ch2 {
         Some(p) => match read_ch2(p) {
@@ -310,6 +302,17 @@ fn read_ch2(path: &Path) -> io::Result<ChannelNames> {
     Ok(channel_names(&ch2::read(path)?))
 }
 
+/// The default `.ch2`, the first that exists: TVTest writes it next to the DLL with the
+/// DLL's name, as the ini has (`--bondriver`), which a relocated `StateFile` or `dt295
+/// serve`'s `<serial>.state` does not; else the state file's name with `.ch2`.
+fn default_ch2(state: &Path, bondriver: Option<&Path>) -> Option<PathBuf> {
+    bondriver
+        .into_iter()
+        .chain([state])
+        .map(|p| p.with_extension("ch2"))
+        .find(|p| p.is_file())
+}
+
 // ---------------------------------------------------------------- SDT -> lineup
 
 /// One SDT section.
@@ -380,77 +383,6 @@ pub(crate) fn sdt_section(sec: &[u8]) -> Option<(Sdt, ServiceLoops<'_>)> {
 /// The service_type of the first service_descriptor of a descriptor loop.
 fn service_type(d: &[u8]) -> Option<u8> {
     descriptors(d).find_map(|(tag, body)| body.first().copied().filter(|_| tag == TAG_SERVICE))
-}
-
-/// A right-hand BS transponder or CS110 ND: BS-`num` or ND`num`, and its IF.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Transponder {
-    pub(crate) bs: bool,
-    pub(crate) num: u16,
-    pub(crate) if_khz: u32,
-}
-
-impl Transponder {
-    fn line_name(&self, rest: impl Display) -> String {
-        let kind = if self.bs { "BS" } else { "ND" };
-        format!("{kind}{:02}/{rest}", self.num)
-    }
-
-    /// The name of a one-TS line (`BS15/TS1`, `ND02/TS0`).
-    pub(crate) fn ts_name(&self, tsid: u16) -> String {
-        self.line_name(format_args!("TS{}", rel_ts(tsid)))
-    }
-
-    /// The name of a one-service line (`BS15/101`).
-    pub(crate) fn service_name(&self, sid: u16) -> String {
-        self.line_name(sid)
-    }
-
-    /// The one-TS line of `tsid`.
-    fn ts_line(&self, tsid: u16) -> String {
-        format!("{}={},0x{tsid:04X}", self.ts_name(tsid), self.if_khz)
-    }
-
-    /// The one-service line of `sid` on `tsid`.
-    fn service_line(&self, tsid: u16, sid: u16) -> String {
-        format!(
-            "{}={},0x{tsid:04X},{sid}",
-            self.service_name(sid),
-            self.if_khz
-        )
-    }
-}
-
-/// original_network_id of BS and of the two CS110 networks.
-const ONID_BS: u16 = 4;
-const ONID_CS: [u16; 2] = [6, 7];
-
-/// The transponder of a satellite TS: BS (network 4, TSID 0x4xxx) or CS110 (networks
-/// 6 and 7, TSID 0x6xxx / 0x7xxx), bits 4-8 of the TSID the BS transponder or ND
-/// number; `None` for any other (terrestrial TSIDs are 0x7xxx too).
-pub(crate) fn transponder(onid: u16, tsid: u16) -> Option<Transponder> {
-    let num = (tsid >> 4) & 0x1F;
-    if onid == ONID_BS && tsid >> 12 == 0x4 && (1..=23).contains(&num) && num % 2 == 1 {
-        return Some(Transponder {
-            bs: true,
-            num,
-            if_khz: bs_if_khz(num),
-        });
-    }
-    let cs = ONID_CS.contains(&onid) && matches!(tsid >> 12, 0x6 | 0x7);
-    (cs && (2..=24).contains(&num) && num.is_multiple_of(2)).then(|| Transponder {
-        bs: false,
-        num,
-        if_khz: cs_if_khz(num),
-    })
-}
-
-fn bs_if_khz(tp: u16) -> u32 {
-    BS_IF_BASE + u32::from(tp - 1) / 2 * BS_IF_STEP
-}
-
-fn cs_if_khz(nd: u16) -> u32 {
-    CS_IF_BASE + u32::from(nd - 2) / 2 * CS_IF_STEP
 }
 
 /// The services of one transport stream.
@@ -571,11 +503,6 @@ fn warn_dups(lines: &[String], section: &str, err: &mut dyn Write) {
             );
         }
     }
-}
-
-/// The relative TS number of a satellite TSID (its low 4 bits).
-fn rel_ts(tsid: u16) -> u16 {
-    tsid & 0xF
 }
 
 /// `[BS]`: one line per TS with a comment listing its services (`per_ts`), or one

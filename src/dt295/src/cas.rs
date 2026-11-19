@@ -16,8 +16,8 @@
 use tracing::{info, warn};
 
 use crate::auth::{Block, cbc0_decrypt, cbc0_encrypt, cmac, nonce, t8_raw};
-use dt295_core::proto::{Io, sleep_ms};
 use crate::{Error, Result};
+use dt295_core::proto::{Io, sleep_ms};
 
 /// KA_KEY = K_RT (xmmword_1400784F8 ^ xmmword_140078538).
 const KA_KEY: [u8; 16] = [

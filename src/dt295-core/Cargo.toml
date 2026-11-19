@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 dt295-usb.workspace = true
+# BonDriver_DT295.ini, read by the BonDriver and the dt295 command alike
+dt295-chdef.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

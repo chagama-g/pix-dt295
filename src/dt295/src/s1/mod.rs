@@ -28,11 +28,11 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::device::Shared;
-use dt295_core::fwdl::{bulk_download, write_idle_params};
-use dt295_core::proto::{FW_STALL_LIMIT, Io, REG_FW_STATE, REG_IRQ, sleep_ms};
 use crate::ts::link::{self, KeyVerdict};
 use crate::ts::{packet, route};
 use crate::{Error, Result, System, TsSink, cas, dtvdec};
+use dt295_core::fwdl::{bulk_download, write_idle_params};
+use dt295_core::proto::{FW_STALL_LIMIT, Io, REG_FW_STATE, REG_IRQ, sleep_ms};
 
 /// The TS endpoint.
 pub(crate) use dt295_core::EP_TS;

@@ -142,7 +142,6 @@ impl<'a, 'b> Session<'a, 'b> {
         let req = fw::pack(self.seq, fw::OP_CALL, address, 0, 0, &[]);
         self.staging.send(&req)
     }
-
 }
 
 /// The monitor's READ/WRITE are 32-bit-word loops, so the address and length must
@@ -326,5 +325,4 @@ mod tests {
         assert!(check_span(0x8038_0000, 6).is_err(), "not word-multiple");
         assert!(check_span(0x8038_0002, 4).is_err(), "unaligned address");
     }
-
 }

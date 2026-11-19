@@ -149,13 +149,7 @@ impl<'a> Io<'a> {
     }
 
     /// A vendor control OUT with the command timeout; returns the bytes sent.
-    pub fn control_out(
-        &self,
-        request: u8,
-        value: u16,
-        index: u16,
-        data: &[u8],
-    ) -> Result<usize> {
+    pub fn control_out(&self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<usize> {
         let s = Setup {
             request_type: RT_OUT,
             request,
@@ -270,14 +264,7 @@ impl<'a> Io<'a> {
     /// 0x090074, and the per-channel ack register (ch0 0x080014, ch1 0x080016) holds the
     /// type echo (hi) and result (lo). Result 0x80 = the firmware rejected the command.
     /// The status bit is cleared with a plain 16-bit write of just that bit.
-    pub fn cmd_ack(
-        &mut self,
-        ch: u8,
-        cmd: u8,
-        sub: u8,
-        par: u16,
-        timeout_ms: u32,
-    ) -> Result<()> {
+    pub fn cmd_ack(&mut self, ch: u8, cmd: u8, sub: u8, par: u16, timeout_ms: u32) -> Result<()> {
         let ackreg = if ch != 0 { 0x080016 } else { 0x080014 };
         let ackbit: u16 = if ch != 0 { 0x0002 } else { 0x0008 };
         // Once the firmware has wedged (stopped acking -- 0x090074 stuck with a pending

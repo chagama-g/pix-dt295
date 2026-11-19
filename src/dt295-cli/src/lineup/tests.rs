@@ -258,26 +258,6 @@ fn sdt_parse() {
 }
 
 #[test]
-fn transponders_of_satellite_tsids() {
-    let tp = |onid, tsid| transponder(onid, tsid).map(|t| (t.bs, t.num, t.if_khz));
-    assert_eq!(tp(4, 0x40F1), Some((true, 15, 1_318_000)));
-    assert_eq!(tp(4, 0x4030), Some((true, 3, 1_087_840)));
-    assert_eq!(
-        tp(4, 0x46D2),
-        Some((true, 13, 1_279_640)),
-        "bits 9-11 are not the number"
-    );
-    assert_eq!(tp(6, 0x6020), Some((false, 2, 1_613_000)));
-    assert_eq!(tp(7, 0x7040), Some((false, 4, 1_653_000)));
-    assert_eq!(tp(7, 0x7160), Some((false, 22, 2_013_000)));
-    assert_eq!(tp(4, 0x4020), None, "BS-2: left-hand");
-    assert_eq!(tp(7, 0x7030), None, "ND03: left-hand");
-    // terrestrial TSIDs are 0x7xxx too (TOKYO MX: 0x7E87, bits 4-8 = 8)
-    assert_eq!(tp(32391, 0x7E87), None);
-    assert_eq!(tp(32736, 0x7FE0), None);
-}
-
-#[test]
 fn bad_sections_rejected() {
     let good = sdt(0x4631, 4, &[(236, 0x01)]);
     let mut bad = good.clone();
@@ -928,4 +908,30 @@ fn command_line() {
     );
     assert!(parse(&["s.state", "--only", "x"]).is_err());
     assert!(parse(&[]).is_err());
+}
+
+#[test]
+fn channel_file_next_to_the_ini() {
+    let s = Scratch::new("default-ch2");
+    // A StateFile in another folder (or serve's <serial>.state): TVTest's .ch2 is the
+    // DLL's, named as the ini.
+    let state = s.path("WI01047227.state");
+    let ini = s.path("BonDriver_DT295-1.ini");
+    assert_eq!(default_ch2(&state, Some(&ini)), None, "none present");
+    fs::write(s.path("WI01047227.ch2"), "").unwrap();
+    assert_eq!(
+        default_ch2(&state, Some(&ini)),
+        Some(s.path("WI01047227.ch2")),
+        "the state's when the ini has none"
+    );
+    fs::write(s.path("BonDriver_DT295-1.ch2"), "").unwrap();
+    assert_eq!(
+        default_ch2(&state, Some(&ini)),
+        Some(s.path("BonDriver_DT295-1.ch2"))
+    );
+    assert_eq!(
+        default_ch2(&state, None),
+        Some(s.path("WI01047227.ch2")),
+        "without --bondriver"
+    );
 }

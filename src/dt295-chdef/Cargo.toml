@@ -1,0 +1,23 @@
+[package]
+name = "dt295-chdef"
+description = "Channel definitions without the device: the Win32 profile API's ini rules, the C number syntax and the BS / CS110 / ISDB-T frequency plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# ini files, read as the Win32 profile API reads them
+rust-ini.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# MultiByteToWideChar: a file in the ANSI code page
+windows-sys = { workspace = true, features = ["Win32_Globalization"] }
+
+[target.'cfg(not(windows))'.dependencies]
+# Shift_JIS (CP932) for a file from Windows, which has no ANSI code page here
+encoding_rs.workspace = true
+
+[lints]
+workspace = true

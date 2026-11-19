@@ -13,8 +13,8 @@ use aes::Aes128;
 use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use tracing::{debug, info, warn};
 
-use dt295_core::proto::{Io, REG_IRQ, sleep_ms};
 use crate::{Error, Result};
+use dt295_core::proto::{Io, REG_IRQ, sleep_ms};
 
 // ---- AES-128 helpers ----
 

@@ -598,8 +598,17 @@ fn sat_band_reg(f_hz: u32) -> u8 {
 }
 
 /// Tune ISDB-S (`freq_hz` = IF, `tsid` = the wanted TS) and wait for lock. Returns the
-/// TSID the demod streams, when it could be read.
+/// TSID the demod streams, when it could be read. A `tsid` up to
+/// [`MAX_TS_NUMBER`](crate::chan::MAX_TS_NUMBER) is a TS number: the tune selects no TS,
+/// then the transponder's TS whose TSID has those low 3 bits ([`select_ts_number`]); an
+/// error when it has none.
 pub fn tune_s(b: &mut impl Bus, freq_hz: u32, tsid: u16) -> Result<Option<u16>> {
+    let number = (tsid <= crate::chan::MAX_TS_NUMBER).then_some(tsid);
+    let tsid = if number.is_some() {
+        crate::chan::NO_TSID
+    } else {
+        tsid
+    };
     let v = ((u64::from(freq_hz) + 250_000) / 500_000) as u32; // round(IF_MHz / 0.5)
     let [r8f, r90] = tsid.to_be_bytes();
     let band = sat_band_reg(freq_hz);
@@ -644,7 +653,39 @@ pub fn tune_s(b: &mut impl Bus, freq_hz: u32, tsid: u16) -> Result<Option<u16>> 
     not_wedged(b)?;
     let locked = wait_lock_s(b);
     not_wedged(b)?;
-    Ok(if locked { check_ts_s(b, tsid) } else { None })
+    if !locked {
+        return Ok(None);
+    }
+    match number {
+        Some(n) => select_ts_number(b, n),
+        None => Ok(check_ts_s(b, tsid)),
+    }
+}
+
+/// After a lock without a TSID: select the transponder's TS whose TSID has the low 3 bits
+/// `n` (the relative TS number, as BonDriver_PTx-ST_mod reads a TSID of 7 or less; Linux's
+/// tc90522 writes the TSID it picks to reg 0x8F / 0x90 the same way). The TMCC can follow
+/// the lock by a moment, so it is read again for up to 1 s. An error when the transponder
+/// has no such TS, so the channel fails instead of streaming another TS.
+fn select_ts_number(b: &mut impl Bus, n: u16) -> Result<Option<u16>> {
+    let mut ids = Vec::new();
+    for _ in 0..10 {
+        ids = ts_ids_s(b).unwrap_or_default();
+        if !ids.is_empty() {
+            break;
+        }
+        b.sleep_ms(100);
+    }
+    let Some(&t) = ids.iter().find(|&&t| t & crate::chan::MAX_TS_NUMBER == n) else {
+        let all: Vec<String> = ids.iter().map(|t| format!("{t:04x}")).collect();
+        warn!("fe1: S no TS {n} (transponder: {})", all.join(" "));
+        return Err(Error::Param("the transponder has no TS of that number"));
+    };
+    info!("fe1: S TS {n} is TSID {t:04x}");
+    let [hi, lo] = t.to_be_bytes();
+    b.i2c_write(DEMOD_S, &[0x8F, hi])?;
+    b.i2c_write(DEMOD_S, &[0x90, lo])?;
+    Ok(check_ts_s(b, t))
 }
 
 /// ISDB-S demod sample, the registers the vendor driver polls while streaming (as
@@ -810,7 +851,11 @@ mod tests {
     fn read_s_and_t_surface_the_lock_registers() {
         let mut b = Rec::default();
         // The lock registers read 0 in the mock (= locked); the wrappers pass that through.
-        assert_eq!(read_t(&mut b, 0x80), 0x00, "DEMOD_T 0x80 bit7 clear = terr lock");
+        assert_eq!(
+            read_t(&mut b, 0x80),
+            0x00,
+            "DEMOD_T 0x80 bit7 clear = terr lock"
+        );
         assert_eq!(read_s(&mut b, 0xC3), 0x00, "DEMOD_S 0xC3 == 0 = sat lock");
         // Any other register reads the mock's 0x5A -- i.e. not locked.
         assert_eq!(read_t(&mut b, 0x10), 0x5A);
@@ -1005,6 +1050,81 @@ mod tests {
             assert_eq!(tail.matches(" R22=e6/2").count(), 10);
             assert!(tail.ends_with(" R22=ce/16"), "{tail}");
         }
+    }
+
+    /// A locked ISDB-S demod with these TMCC TSIDs: streams the one selected at reg 0x8F /
+    /// 0x90 (none selected: reads 0xFFFF), or the first for one it does not carry.
+    struct Tmcc {
+        ids: Vec<u16>,
+        select: [u8; 2],
+        writes: String,
+    }
+
+    impl Tmcc {
+        fn new(ids: &[u16]) -> Self {
+            Self {
+                ids: ids.to_vec(),
+                select: [0; 2],
+                writes: String::new(),
+            }
+        }
+    }
+
+    impl Bus for Tmcc {
+        fn i2c_write(&mut self, slave: u8, data: &[u8]) -> Result<()> {
+            if slave == DEMOD_S && data.len() == 2 {
+                match data[0] {
+                    0x8F => self.select[0] = data[1],
+                    0x90 => self.select[1] = data[1],
+                    _ => return Ok(()),
+                }
+                write!(self.writes, " {}", hex(data)).unwrap();
+            }
+            Ok(())
+        }
+        fn i2c_write_read(&mut self, slave: u8, w: &[u8], r: &mut [u8]) -> Result<()> {
+            r.fill(0);
+            let selected = u16::from_be_bytes(self.select);
+            match (slave, w) {
+                (DEMOD_S, [0xCE]) => {
+                    for (slot, id) in r.chunks_mut(2).zip(&self.ids) {
+                        slot.copy_from_slice(&id.to_be_bytes());
+                    }
+                }
+                (DEMOD_S, [0xE6]) => {
+                    let streams = match selected {
+                        0xFFFF => 0xFFFF,
+                        t if self.ids.contains(&t) => t,
+                        _ => self.ids[0],
+                    };
+                    r.copy_from_slice(&streams.to_be_bytes());
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn sleep_ms(&mut self, _: u64) {}
+    }
+
+    #[test]
+    fn ts_numbers() {
+        // TS 1 of BS-1: tuned without a TSID, then 0x4011 selected and streamed
+        let mut b = Tmcc::new(&[0x4010, 0x4011, 0x4012]);
+        assert_eq!(tune_s(&mut b, 1_049_480_000, 1).unwrap(), Some(0x4011));
+        assert_eq!(b.writes, " 8fff 90ff 8f40 9011");
+        // by the low 3 bits, not the slot: BS-3's renumbered TS1 and TS2
+        let mut b = Tmcc::new(&[0x4030, 0x4631, 0x4632]);
+        assert_eq!(tune_s(&mut b, 1_087_840_000, 2).unwrap(), Some(0x4632));
+        // CS110's one TS for the 0x0 of BonDriver_BDA's sample
+        let mut b = Tmcc::new(&[0x6020]);
+        assert_eq!(tune_s(&mut b, 1_613_000_000, 0).unwrap(), Some(0x6020));
+        // a TS the transponder does not carry: an error, not another TS
+        let mut b = Tmcc::new(&[0x4010, 0x4011, 0x4012]);
+        assert!(tune_s(&mut b, 1_049_480_000, 3).is_err());
+        // a TSID is as before
+        let mut b = Tmcc::new(&[0x4010, 0x4011]);
+        assert_eq!(tune_s(&mut b, 1_049_480_000, 0x4011).unwrap(), Some(0x4011));
+        assert_eq!(b.writes, " 8f40 9011");
     }
 
     /// A firmware that stopped acking: every transfer fails; counts the time slept.

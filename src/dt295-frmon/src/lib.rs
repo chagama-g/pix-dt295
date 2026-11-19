@@ -319,7 +319,10 @@ impl Asm {
     /// All instructions are 2- or 4-byte, so `here()` stays even; panics if already past `addr`.
     pub fn pad_to(&mut self, addr: u32) {
         assert!(self.here() <= addr, "pad_to: already at/past {addr:#x}");
-        assert!((addr - self.here()).is_multiple_of(2), "pad_to: odd gap to {addr:#x}");
+        assert!(
+            (addr - self.here()).is_multiple_of(2),
+            "pad_to: odd gap to {addr:#x}"
+        );
         while self.here() < addr {
             self.nop();
         }

@@ -23,14 +23,14 @@ use super::{
     route_write, service_events,
 };
 use crate::device::{Shared, State};
-use dt295_core::proto::{Io, sleep_ms};
-use dt295_core::signal::{cn_s_mdb, cn_t_mdb};
 use crate::ts::es::EsCheck;
 use crate::ts::psi::StreamView;
 use crate::ts::route::{Op, Router};
 use crate::ts::stats::RawStats;
 use crate::ts::{link, packet, pat};
 use dt295_core::fe1;
+use dt295_core::proto::{Io, sleep_ms};
+use dt295_core::signal::{cn_s_mdb, cn_t_mdb};
 
 use crate::{Result, System, TsSink};
 

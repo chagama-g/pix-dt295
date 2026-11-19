@@ -6,7 +6,8 @@
 //! under a minute about every 20 minutes at irregular times, not always all of them,
 //! and in some periods not at all, so a viewer hardly ever receives them. This command
 //! takes a free unit (with the firmware and state file of its BonDriver ini in TVTest's
-//! BonDriver folder), holds it on the engineering service until the logos are in, and
+//! BonDriver folder; on the raw-TS path of a `RawTS=1` ini, booting nothing, so the unit
+//! stays usable for raw-TS), holds it on the engineering service until the logos are in, and
 //! merges them into TVTest's logo data file, its logo ID map and its logo folder, the
 //! way TVTest stores logos it receives itself. `--schedule` makes it a daily task, like
 //! the background download of the vendor's application.
@@ -29,22 +30,25 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use dt295::System;
 
 use crate::bonini::BonDriver;
+use crate::rawts;
+use crate::serve::proto::Tuning;
 use crate::tuner::{self, DeviceArgs, Unit, stopping};
 use carousel::{Collector, Logo};
 use tvtest::{Store, TRANSPARENT_MAX, TvTest};
 
 /// The engineering service that carries the logos: BS-15 (IF 1318.000 MHz).
-const ENG_IF_HZ: u32 = 1_318_000_000;
+const ENG_IF_HZ: u32 = dt295::chan::bs_if_khz(15).unwrap() * 1000;
 const ENG_SID: u16 = 929;
 /// Seconds from 1601-01-01 (TVTest's time base) to 1970-01-01.
 const SECS_1601_TO_UNIX: u64 = 11_644_473_600;
@@ -228,8 +232,8 @@ fn receive(a: &LogoArgs, tv: &TvTest) -> Result<Collector> {
     let shared = Arc::new(Mutex::new(Collector::new(a.sid)));
     let mut said_busy = false;
     while !stopping() && unix_now() < deadline && !lock(&shared).done() {
-        let dev = if bons.is_empty() {
-            a.dev.clone()
+        let (dev, raw) = if bons.is_empty() {
+            (a.dev.clone(), false)
         } else {
             match choose(&bons, a.dev.serial.as_deref())? {
                 Some(d) => d,
@@ -243,7 +247,12 @@ fn receive(a: &LogoArgs, tv: &TvTest) -> Result<Collector> {
                 }
             }
         };
-        match hold(a, &dev, &shared, deadline, console) {
+        let held = if raw {
+            hold_raw(a, &dev, &shared, deadline, console)
+        } else {
+            hold(a, &dev, &shared, deadline, console)
+        };
+        match held {
             Ok(()) => break, // the logos are in, the time is up, or Ctrl-C
             Err(e) => {
                 println!("{}: {e:#}", jst_text(unix_now(), false));
@@ -254,8 +263,10 @@ fn receive(a: &LogoArgs, tv: &TvTest) -> Result<Collector> {
     Ok(std::mem::take(&mut *lock(&shared)))
 }
 
-/// A free unit (only `only` if given) with its BonDriver's firmware and state file.
-fn choose(bons: &[BonDriver], only: Option<&str>) -> Result<Option<DeviceArgs>> {
+/// A free unit (only `only` if given) with its BonDriver's firmware and state file, and
+/// whether that ini is on the raw-TS path (`RawTS=1`: boot nothing, as the BonDriver).
+/// An ini without a trc firmware (`TrcFirmware=`) is an error: no stream can start.
+fn choose(bons: &[BonDriver], only: Option<&str>) -> Result<Option<(DeviceArgs, bool)>> {
     let units = dt295::list().context("enumerate USB devices")?;
     let free: Vec<String> = units
         .iter()
@@ -267,17 +278,26 @@ fn choose(bons: &[BonDriver], only: Option<&str>) -> Result<Option<DeviceArgs>> 
         return Ok(None);
     };
     let files = bon.unwrap_or(&bons[0]);
-    match bon {
-        Some(b) => println!("using unit {serial} ({})", b.ini.display()),
-        None => println!("using unit {serial} (no BonDriver ini names it)"),
+    let raw = files.tuner.raw_ts;
+    if !raw && files.tuner.trc_firmware.is_none() {
+        bail!(
+            "{}: TrcFirmware is empty, so no stream can start (as in the BonDriver)",
+            files.ini.display()
+        );
     }
-    Ok(Some(DeviceArgs {
-        fw: Some(files.fw.clone()),
-        trc: Some(files.trc.clone()),
+    let path = if raw { ", raw-TS" } else { "" };
+    match bon {
+        Some(b) => println!("using unit {serial} ({}{path})", b.ini.display()),
+        None => println!("using unit {serial} (no BonDriver ini names it{path})"),
+    }
+    let dev = DeviceArgs {
+        fw: Some(files.tuner.firmware.clone()),
+        trc: files.tuner.trc_firmware.clone(),
         index: 0,
         serial: Some(serial),
-        state: bon.map(|b| b.state.clone()),
-    }))
+        state: bon.map(|b| b.tuner.state_file.clone()),
+    };
+    Ok(Some((dev, raw)))
 }
 
 /// Tune the engineering service and collect until the logos are in or until `end`.
@@ -296,6 +316,61 @@ fn hold(
     unit.dev
         .stream_start(Box::new(move |ts: &[u8]| lock(&worker).feed(ts)))
         .context("stream start")?;
+    let stalled = collect(shared, end, console);
+    let stopped = unit.dev.stream_stop(); // the worker no longer feeds after this
+    unit.save_link_key();
+    if stalled {
+        bail!(
+            "no decodable PAT for {} s: the stream stopped, or the link key does not match",
+            STALL.as_secs()
+        );
+    }
+    stopped.context("stream stop")
+}
+
+/// [`hold`] on the raw-TS path ([`rawts`]): open the unit without booting anything, bring
+/// the chip up (once per plug) or only retune, and collect from the scrambled TS of the
+/// whole transponder (the tables and the engineering service are not scrambled). No
+/// state file.
+fn hold_raw(
+    a: &LogoArgs,
+    dev: &DeviceArgs,
+    shared: &Arc<Mutex<Collector>>,
+    end: u64,
+    console: bool,
+) -> Result<()> {
+    let mut d = tuner::open_device(dev)?;
+    let bytes = Arc::new(AtomicU64::new(0));
+    let (worker, count) = (Arc::clone(shared), Arc::clone(&bytes));
+    let sink = Box::new(move |ts: &[u8]| {
+        count.fetch_add(ts.len() as u64, Ordering::Relaxed);
+        lock(&worker).feed(ts);
+    });
+    let tuning = Tuning::Satellite {
+        hz: a.sat,
+        tsid: a.tsid,
+    };
+    let full = rawts::start(&mut d, tuning, sink).map_err(|why| anyhow!("raw-TS: {why}"))?;
+    if !rawts::wait_first_ts(&d, || bytes.load(Ordering::Relaxed)) {
+        if stopping() {
+            return d.stream_stop_raw().map(drop).context("raw stream stop");
+        }
+        bail!("raw-TS: {}", rawts::why_no_ts(&mut d, full));
+    }
+    let stalled = collect(shared, end, console);
+    let stopped = d.stream_stop_raw();
+    if stalled {
+        bail!(
+            "no PAT for {} s: the stream stopped (the worker ended or the signal went)",
+            STALL.as_secs()
+        );
+    }
+    stopped.map(drop).context("raw stream stop")
+}
+
+/// While a stream feeds `shared`: show the progress until the logos are in, `end` comes,
+/// a stop signal or a stream without a valid PAT for [`STALL`] (true).
+fn collect(shared: &Arc<Mutex<Collector>>, end: u64, console: bool) -> bool {
     let mut seen = (lock(shared).pats, Instant::now());
     let mut stalled = false;
     loop {
@@ -327,15 +402,7 @@ fn hold(
         jst_text(unix_now(), false),
         lock(shared).progress()
     );
-    let stopped = unit.dev.stream_stop(); // the worker no longer feeds after this
-    unit.save_link_key();
-    if stalled {
-        bail!(
-            "no decodable PAT for {} s: the stream stopped, or the link key does not match",
-            STALL.as_secs()
-        );
-    }
-    stopped.context("stream stop")
+    stalled
 }
 
 /// The logos of the TS given with --ts: a file, or `-` read as it comes until the logos

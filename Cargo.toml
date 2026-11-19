@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "src/dt295-usb",
+    "src/dt295-chdef",
     "src/dt295-core",
     "src/dt295-rawfw",
     "src/dt295",
@@ -11,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
@@ -19,6 +20,7 @@ publish = false
 
 [workspace.dependencies]
 dt295-usb = { path = "src/dt295-usb" }
+dt295-chdef = { path = "src/dt295-chdef" }
 dt295-core = { path = "src/dt295-core" }
 dt295-rawfw = { path = "src/dt295-rawfw" }
 dt295 = { path = "src/dt295" }
@@ -46,6 +48,7 @@ cbc = "0.2.1"
 crc = "3.4.0"
 getrandom = "0.4.3"
 rust-ini = { version = "0.21.3", features = ["case-insensitive"] }
+encoding_rs = "0.8.44"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2.5"

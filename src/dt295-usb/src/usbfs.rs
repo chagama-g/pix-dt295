@@ -271,14 +271,31 @@ fn is_free(info: &nusb::DeviceInfo) -> bool {
         .is_ok_and(|d| d.claim_interface(0).wait().is_ok())
 }
 
+/// The `index`-th of `units` that `free` passes. When there are not that many:
+/// [`Error::Access`] if there are that many units but one was skipped (held: it may be
+/// free in a moment, as WinUSB reports a unit it cannot open), else [`Error::NoDevice`].
+fn nth_free<T>(units: Vec<T>, mut free: impl FnMut(&T) -> bool, index: usize) -> Result<T> {
+    let enough = index < units.len();
+    let mut skipped = false;
+    let found = units
+        .into_iter()
+        .filter(|u| {
+            let f = free(u);
+            skipped |= !f;
+            f
+        })
+        .nth(index);
+    found.ok_or(if skipped && enough {
+        Error::Access
+    } else {
+        Error::NoDevice
+    })
+}
+
 impl Device {
     /// The `index`-th free unit, as WinUSB counts them (a held unit is skipped).
     pub(crate) fn open(vid: u16, pid: u16, index: usize) -> Result<Self> {
-        let info = matching(vid, pid)?
-            .into_iter()
-            .filter(is_free)
-            .nth(index)
-            .ok_or(Error::NoDevice)?;
+        let info = nth_free(matching(vid, pid)?, is_free, index)?;
         Self::open_info(&info)
     }
 
@@ -566,6 +583,19 @@ mod tests {
         );
         assert_matches!(map_transfer_error(TransferError::Unknown(5)), Error::Io(5));
         assert_matches!(map_control_error(TransferError::Cancelled), Error::Timeout);
+    }
+
+    #[test]
+    fn index_counts_free_units() {
+        let free = |u: &&str| !u.starts_with("held");
+        assert_matches!(nth_free(vec!["a", "held", "b"], free, 1), Ok("b"));
+        assert_matches!(nth_free(vec!["a", "held"], free, 0), Ok("a"));
+        // not that many free: in use (a retry may open it), or not there
+        assert_matches!(nth_free(vec!["a", "held"], free, 1), Err(Error::Access));
+        assert_matches!(nth_free(vec!["a"], free, 1), Err(Error::NoDevice));
+        assert_matches!(nth_free(Vec::<&str>::new(), free, 0), Err(Error::NoDevice));
+        // not that many units at all: no device, held one or not
+        assert_matches!(nth_free(vec!["a", "held"], free, 2), Err(Error::NoDevice));
     }
 
     #[test]

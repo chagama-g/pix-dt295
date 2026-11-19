@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
+use dt295_core::bonini::DeviceSel;
 use dt295_core::fe1;
 use dt295_core::proto::{FW_STALL_LIMIT, Io, Proto, REG_FW_STATE};
 
@@ -250,6 +251,8 @@ pub struct Device {
 struct RawWorker {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<(TsSink, Result<crate::RawCaptureStats>)>,
+    /// A stop already waited the whole time for it: the next one does not wait again.
+    wedged: bool,
 }
 
 impl fmt::Debug for RawWorker {
@@ -257,6 +260,7 @@ impl fmt::Debug for RawWorker {
         f.debug_struct("RawWorker")
             .field("stop", &self.stop.load(Ordering::Relaxed))
             .field("finished", &self.handle.is_finished())
+            .field("wedged", &self.wedged)
             .finish()
     }
 }
@@ -323,6 +327,10 @@ impl Live {
     }
 }
 
+/// Attempts and pause of [`Device::open_sel`].
+pub const OPEN_ATTEMPTS: usize = 5;
+pub const OPEN_RETRY_PAUSE: Duration = Duration::from_millis(400);
+
 impl Device {
     /// Open the `index`-th PIX-DT295 bound to WinUSB (no device I/O beyond the open).
     ///
@@ -334,6 +342,27 @@ impl Device {
             dt295_usb::PID,
             index,
         ))
+    }
+
+    /// Open the unit `sel` names ([`Device::open`] or [`Device::open_serial`]), trying
+    /// again for a moment ([`OPEN_ATTEMPTS`] x [`OPEN_RETRY_PAUSE`]) while it is there but
+    /// cannot be opened: after a close (or a crash) the WinUSB handle can linger, and a
+    /// fresh open fails until the OS releases it. A unit that is not there
+    /// ([`Error::NoDevice`]) fails at once.
+    pub fn open_sel(sel: &DeviceSel) -> Result<Self> {
+        let open = || match sel {
+            DeviceSel::Index(n) => Self::open(*n),
+            DeviceSel::Serial(s) => Self::open_serial(s),
+        };
+        let mut opened = open();
+        for _ in 1..OPEN_ATTEMPTS {
+            if matches!(opened, Ok(_) | Err(Error::NoDevice)) {
+                break;
+            }
+            thread::sleep(OPEN_RETRY_PAUSE);
+            opened = open();
+        }
+        opened
     }
 
     /// Open the PIX-DT295 with this USB serial number (e.g. `CD23456789`, as
@@ -391,7 +420,11 @@ impl Device {
                 (sink, result)
             })
             .map_err(Error::from)?;
-        self.raw = Some(RawWorker { stop, handle });
+        self.raw = Some(RawWorker {
+            stop,
+            handle,
+            wedged: false,
+        });
         Ok(())
     }
 
@@ -412,12 +445,17 @@ impl Device {
     /// uninterruptible cold bootstrap finishes it first, then exits, which this waits out
     /// (it does not abort the EP mid-bootstrap, which would fault the tune). A genuinely
     /// wedged worker gets one EP nudge as a last resort; one that still will not exit keeps
-    /// its own device reference (nothing is freed under it) and a re-plug is the reset.
+    /// its own device reference (nothing is freed under it) and a re-plug is the reset;
+    /// a later stop (another try, the close) gives that error at once if it still runs.
     /// No-op if none is running.
     pub fn stream_stop_raw(&mut self) -> Result<crate::RawCaptureStats> {
-        let Some(w) = self.raw.take() else {
+        let Some(mut w) = self.raw.take() else {
             return Ok(crate::RawCaptureStats::default());
         };
+        if w.wedged && !w.handle.is_finished() {
+            self.raw = Some(w);
+            return Err(Error::State("the raw-TS stream worker did not exit".into()));
+        }
         w.stop.store(false, Ordering::Relaxed);
         // The stream loop polls the stop flag every pass (~1 ms, the EP read timeout) and
         // exits on its own, so no EP abort is needed to unstick it. A worker still in the
@@ -449,6 +487,7 @@ impl Device {
                 error!(
                     "raw-TS worker did not exit within 35 s; leaving it running -- re-plug the device"
                 );
+                w.wedged = true;
                 self.raw = Some(w);
                 return Err(Error::State("the raw-TS stream worker did not exit".into()));
             }
@@ -535,10 +574,14 @@ impl Device {
         freq_hz: u32,
         tsid: Option<u16>,
     ) -> (Result<bool>, Vec<String>) {
-        match self
-            .sh
-            .with_io(|io| Ok(dt295_rawfw::fjcore::cold_capture(io, terrestrial, freq_hz, tsid)))
-        {
+        match self.sh.with_io(|io| {
+            Ok(dt295_rawfw::fjcore::cold_capture(
+                io,
+                terrestrial,
+                freq_hz,
+                tsid,
+            ))
+        }) {
             Ok(pair) => pair,
             Err(e) => (Err(e), Vec::new()),
         }
@@ -828,9 +871,13 @@ impl Device {
         self.sh.lock().psi.import(rec, crate::today())
     }
 
-    /// The PSI cache gained or refreshed sections since the last export/import.
+    /// The PSI cache gained or refreshed sections since the last export/import, or lost
+    /// some that went unseen for [`crate::PSI_KEEP_DAYS`] (they age out here too, for a
+    /// host that runs for months).
     pub fn psi_changed(&self) -> bool {
-        self.sh.lock().psi.changed()
+        let mut sh = self.sh.lock();
+        sh.psi.age(crate::today());
+        sh.psi.changed()
     }
 }
 

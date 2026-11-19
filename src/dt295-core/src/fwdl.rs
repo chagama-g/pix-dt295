@@ -10,6 +10,13 @@ use crate::proto::Io;
 
 const EP_FW: u8 = 0x02;
 
+/// The idle firmware's file name in the vendor package (the default of the BonDriver
+/// ini's `Firmware` and of `dt295 serve`).
+pub const IDLE_FIRMWARE: &str = "mb86m01_assp_osec_idle.bin";
+/// The System1 transcoder firmware's file name in the vendor package (the default of
+/// `TrcFirmware`).
+pub const TRC_FIRMWARE: &str = "mb86m01_assp_osec_trc_m_h.bin";
+
 /// Send an image on EP 0x02 in <= 64 KiB pieces (the trc hot load uses this too).
 /// `Err((offset, error))` with the offset of the failed piece; the pipe halt is cleared.
 pub fn bulk_download(io: &Io, img: &[u8]) -> std::result::Result<(), (usize, Error)> {

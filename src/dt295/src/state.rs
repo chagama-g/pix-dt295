@@ -10,8 +10,8 @@
 //! rawchannel <space> <channel>
 //! ```
 //! One record per line; unknown keywords (also an older version's `service` lines) are
-//! skipped and go at the next save. Saved via `<file>.tmp` and a rename so a crash keeps
-//! the previous file.
+//! skipped and go at the next save. Saved via `<file>.<process id>.tmp` and a rename so a
+//! crash keeps the previous file.
 //!
 //! Parsing: the first whitespace-separated token of a line is the keyword, `#...` lines are
 //! comments, unknown keywords (including the `dt295-state` version line) are
@@ -23,12 +23,25 @@
 //! [`MAX_PENDING_KEYS`]) are keys the device handed out to processes that ended before
 //! a stream proved them. After the device's secure session lapsed, the first key it
 //! hands out is the one it applies, so one of these may be it.
+//!
+//! The rules for a host (the BonDriver, `dt295 capture`, `dt295 serve`) are here too:
+//! the keys to offer at a start ([`State::prior_keys`]), the keys to keep after a
+//! stream ([`State::take_link_keys`]), the PSI cache across a start
+//! ([`State::import_psi`]), the journal of handed-out keys ([`key_journal`]) and the
+//! reading of a file another host may be writing ([`State::load_settled`]: one that
+//! still cannot be read is left alone).
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
-use crate::PsiRecord;
+use tracing::warn;
+
+use crate::{Device, KeyJournal, PsiRecord};
 
 /// The whole state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,6 +58,11 @@ pub struct State {
 /// The most `linkkey-pending` keys kept.
 pub const MAX_PENDING_KEYS: usize = 4;
 
+/// How often [`State::load_settled`] reads a file that cannot be read, and how long it
+/// waits in between (a rename takes milliseconds).
+const LOAD_TRIES: u32 = 4;
+const LOAD_RETRY: Duration = Duration::from_millis(50);
+
 /// The comment lines at the top of every state file.
 const HEADER: &str = "# BonDriver_DT295 state: written by the driver, rebuilt if deleted.\n\
                       # Do not edit while the tuner is open.\n\
@@ -60,6 +78,45 @@ impl State {
         self.pending_keys.retain(|k| *k != key);
         self.pending_keys.insert(0, key);
         self.pending_keys.truncate(MAX_PENDING_KEYS);
+    }
+
+    /// The keys to offer the device before its start ([`Device::set_prior_link_keys`]),
+    /// in the order to try them: the one a stream proved, then the unproved ones.
+    pub fn prior_keys(&self) -> Vec<[u8; 16]> {
+        self.link_key
+            .into_iter()
+            .chain(self.pending_keys.iter().copied())
+            .collect()
+    }
+
+    /// Take the link keys of an open device: `proved`, the key a stream proved
+    /// ([`Device::link_key`]), and `unproved`, the one the device handed out at its
+    /// last start while that is not the proved one ([`Device::unproved_link_key`]). The
+    /// unproved keys give way to that one: the device may still switch to it. Nothing
+    /// proved = nothing taken. Whether the state changed.
+    pub fn take_link_keys(&mut self, proved: Option<[u8; 16]>, unproved: Option<[u8; 16]>) -> bool {
+        let Some(key) = proved else {
+            return false;
+        };
+        let unproved: Vec<[u8; 16]> = unproved.into_iter().collect();
+        if self.link_key == Some(key) && self.pending_keys == unproved {
+            return false;
+        }
+        self.link_key = Some(key);
+        self.pending_keys = unproved;
+        true
+    }
+
+    /// Hand the PSI cache to `dev` before its start ([`Device::psi_import`]); what the
+    /// core takes becomes the state's PSI (it drops what was unseen for 90 days).
+    /// Whether some aged out: then the file should be written again.
+    pub fn import_psi(&mut self, dev: &mut Device) -> bool {
+        let kept = self.psi.iter().filter(|r| dev.psi_import(r)).count();
+        let aged = kept != self.psi.len();
+        if !self.psi.is_empty() {
+            self.psi = dev.psi_export(); // the core now holds them
+        }
+        aged
     }
 
     /// Parse the text format.
@@ -147,7 +204,25 @@ impl State {
         }
     }
 
-    /// Write `path` atomically (`<path>.tmp` + rename over).
+    /// [`State::load`], tried again for a moment when the file is there but cannot be
+    /// read: another host may be putting its new copy in place (Windows can refuse the
+    /// open while the rename replaces the file). An error after that is one the caller
+    /// keeps: it leaves the file alone, as rewriting it from what it knows would lose the
+    /// file's link keys and PSI.
+    pub fn load_settled(path: &Path) -> std::io::Result<Option<Self>> {
+        let mut tries = 1;
+        loop {
+            match Self::load(path) {
+                Err(_) if tries < LOAD_TRIES => {
+                    tries += 1;
+                    thread::sleep(LOAD_RETRY);
+                }
+                done => return done,
+            }
+        }
+    }
+
+    /// Write `path` atomically (`<path>.<process id>.tmp` + rename over).
     ///
     /// The data is synced to disk before the rename, which replaces an existing
     /// file (on Windows too). On any error the `.tmp` file is removed and the
@@ -172,9 +247,40 @@ impl State {
     }
 }
 
-/// `<path>.tmp` (the suffix is appended to the full file name).
+/// A [`KeyJournal`] that keeps each key the device hands out in the state file `path`
+/// at once, unproved ([`State::add_pending_key`]); `written` is set when one was. After
+/// the device's secure session lapsed, the key it hands out is the one it applies, and a
+/// recorder may SIGKILL the process before a stream proves it: then only the file still
+/// knows it. A file that exists but cannot be read is left alone: rewriting it would
+/// lose its link key and PSI.
+pub fn key_journal(path: PathBuf, written: Arc<AtomicBool>) -> KeyJournal {
+    Box::new(move |key| {
+        let mut st = match State::load_settled(&path) {
+            Ok(st) => st.unwrap_or_default(),
+            Err(e) => {
+                warn!(
+                    "link key: cannot read {} ({e}); the key handed out is not kept",
+                    path.display()
+                );
+                return;
+            }
+        };
+        st.add_pending_key(key);
+        match st.save(&path) {
+            Ok(()) => written.store(true, Ordering::Relaxed),
+            Err(e) => warn!(
+                "link key: cannot keep the key handed out in {} ({e})",
+                path.display()
+            ),
+        }
+    })
+}
+
+/// `<path>.<process id>.tmp` (the suffix is appended to the full file name): two hosts
+/// saving the same file at once (the BonDriver and `dt295 capture` with its ini) must not
+/// write one `.tmp` file together, which could rename a mix of both over it.
 fn tmp_path(path: &Path) -> PathBuf {
-    path.with_added_extension("tmp")
+    path.with_added_extension(format!("{}.tmp", std::process::id()))
 }
 
 fn parse_psi<'a>(tok: &mut impl Iterator<Item = &'a str>) -> Option<PsiRecord> {
@@ -279,6 +385,127 @@ mod tests {
         let text = st.render();
         assert!(text.contains("linkkey-pending 05050505050505050505050505050505\n"));
         assert_eq!(State::parse(&text), st);
+    }
+
+    #[test]
+    fn keys_offered_at_a_start() {
+        let mut st = State::default();
+        assert!(st.prior_keys().is_empty());
+        st.pending_keys = vec![[2; 16], [3; 16]];
+        assert_eq!(st.prior_keys(), [[2; 16], [3; 16]], "unproved ones only");
+        st.link_key = Some([1; 16]);
+        assert_eq!(
+            st.prior_keys(),
+            [[1; 16], [2; 16], [3; 16]],
+            "the proved key first"
+        );
+    }
+
+    #[test]
+    fn keys_taken_after_a_stream() {
+        let mut st = State {
+            link_key: Some([1; 16]),
+            pending_keys: vec![[2; 16], [3; 16]],
+            ..State::default()
+        };
+        let before = st.clone();
+        assert!(!st.take_link_keys(None, Some([9; 16])), "nothing proved");
+        assert_eq!(st, before);
+        // The device proved the old key but was handed a new one at this start: it may
+        // still switch to that one, the older unproved keys give way.
+        assert!(st.take_link_keys(Some([1; 16]), Some([4; 16])));
+        assert_eq!(
+            (st.link_key, st.pending_keys.clone()),
+            (Some([1; 16]), vec![[4; 16]])
+        );
+        assert!(
+            !st.take_link_keys(Some([1; 16]), Some([4; 16])),
+            "the same again"
+        );
+        // It proved the key it was handed: nothing is pending any more.
+        assert!(st.take_link_keys(Some([4; 16]), None));
+        assert_eq!(
+            (st.link_key, st.pending_keys.clone()),
+            (Some([4; 16]), vec![])
+        );
+        assert!(!st.take_link_keys(Some([4; 16]), None));
+    }
+
+    #[test]
+    fn journal_of_handed_out_keys() {
+        let dir = scratch_dir("journal");
+        let written = Arc::new(AtomicBool::new(false));
+
+        // No file yet: one with the key as pending.
+        let path = dir.join("new.state");
+        key_journal(path.clone(), Arc::clone(&written))([5; 16]);
+        assert!(written.swap(false, Ordering::Relaxed));
+        let st = State::load(&path).unwrap().unwrap();
+        assert_eq!((st.link_key, st.pending_keys), (None, vec![[5; 16]]));
+
+        // A file: everything else in it stays, the key goes to the front.
+        let path = dir.join("old.state");
+        let mut old = sample_state();
+        old.pending_keys = vec![[6; 16]];
+        old.save(&path).unwrap();
+        let mut journal = key_journal(path.clone(), Arc::clone(&written));
+        journal([7; 16]);
+        journal(old.link_key.unwrap()); // the proved key is not pending
+        assert!(written.swap(false, Ordering::Relaxed));
+        let st = State::load(&path).unwrap().unwrap();
+        assert_eq!(st.pending_keys, [[7; 16], [6; 16]]);
+        assert_eq!((st.link_key, &st.psi), (old.link_key, &old.psi));
+        assert_eq!(st.raw_channel, old.raw_channel);
+
+        // A file that cannot be read (here a directory) is left alone.
+        let path = dir.join("unreadable.state");
+        fs::create_dir_all(path.join("child")).unwrap();
+        key_journal(path.clone(), Arc::clone(&written))([8; 16]);
+        assert!(!written.load(Ordering::Relaxed), "nothing written");
+        assert!(path.join("child").is_dir());
+        assert!(!tmp_path(&path).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A state file the process may not read, in a folder it may write: a rename would
+    /// replace it with one that has only the pending key.
+    #[cfg(unix)]
+    #[test]
+    fn journal_keeps_an_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("journal-perm");
+        let path = dir.join("BonDriver_DT295.state");
+        sample_state().save(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&path).is_ok() {
+            // root reads it anyway: nothing to test
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let written = Arc::new(AtomicBool::new(false));
+        key_journal(path.clone(), Arc::clone(&written))([8; 16]);
+        assert!(!written.load(Ordering::Relaxed));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            State::load(&path).unwrap(),
+            Some(sample_state()),
+            "untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_settled_keeps_an_error() {
+        let dir = scratch_dir("settled");
+        let path = dir.join("BonDriver_DT295.state");
+        assert_eq!(State::load_settled(&path).unwrap(), None, "absent: none");
+        sample_state().save(&path).unwrap();
+        assert_eq!(State::load_settled(&path).unwrap(), Some(sample_state()));
+        // a folder where the file goes: still unreadable after the tries
+        let folder = dir.join("folder.state");
+        fs::create_dir(&folder).unwrap();
+        assert!(State::load_settled(&folder).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -393,6 +620,18 @@ mod tests {
         st.save(&path).unwrap();
         assert_eq!(State::load(&path).unwrap(), Some(st.clone()));
         assert!(!tmp_path(&path).exists(), "the .tmp file is renamed away");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "nothing but the file"
+        );
+        let tmp = tmp_path(&path);
+        let tmp = tmp.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            tmp,
+            format!("BonDriver_DT295.state.{}.tmp", std::process::id()),
+            "one .tmp file per process"
+        );
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.starts_with("# BonDriver_DT295 state"));
         if cfg!(windows) {

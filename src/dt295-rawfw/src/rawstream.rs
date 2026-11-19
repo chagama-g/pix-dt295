@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::frmon_host::MonitorResident;
-use dt295_core::proto::Io;
 use dt295_core::EP_TS;
+use dt295_core::proto::Io;
 use dt295_core::{Error, Result, TsSink};
 
 /// One EP 0x81 read buffer: 60 KiB, a multiple of the 512-byte bulk packet (the fallback
@@ -456,7 +456,10 @@ fn raw_dump_once(data: &[u8]) {
         .map(|(stride, n)| format!("{stride}:{n}"))
         .collect::<Vec<_>>()
         .join(" ");
-    info!("raw-dump: 0x47 gaps over {} B ({total} gaps) top stride:count = {summary}", scan.len());
+    info!(
+        "raw-dump: 0x47 gaps over {} B ({total} gaps) top stride:count = {summary}",
+        scan.len()
+    );
 }
 
 /// Reframe one bulk chunk into 188-byte packets, check their continuity and forward them

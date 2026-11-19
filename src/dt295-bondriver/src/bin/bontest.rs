@@ -11,6 +11,16 @@
 //!                                                  space / range in turn (what TVTest channel
 //!                                                  scans ask of the driver), timing each call;
 //!                                                  e.g. `scan 2:0 0` = BS ch 0, then all of UHF
+//! bontest <BonDriver.dll> idle [seconds]
+//!                                                  open, hold the tuner without a channel
+//!                                                  (default 60 s), close: the idle keeper's
+//!                                                  work (keepalive, unplug and re-plug)
+//! bontest <BonDriver.dll> reopen <space> <ch> [seconds] [pause]
+//!                                                  open, tune, stream, close, then after
+//!                                                  `pause` s (default 90) all again with the
+//!                                                  DLL still loaded: a host that keeps it
+//!                                                  (what another program did to the state
+//!                                                  file meanwhile)
 //! ```
 //!
 //! The second form needs the device bound to WinUSB and the firmware next to the DLL
@@ -92,7 +102,9 @@ mod host {
         if args.len() < 2 {
             eprintln!(
                 "usage: bontest <BonDriver.dll> [<space> <channel> [seconds] [out.ts]]\n       \
-                 bontest <BonDriver.dll> scan <space>[:<first>[-<last>]]..."
+                 bontest <BonDriver.dll> scan <space>[:<first>[-<last>]]...\n       \
+                 bontest <BonDriver.dll> idle [seconds]\n       \
+                 bontest <BonDriver.dll> reopen <space> <channel> [seconds] [pause]"
             );
             return ExitCode::from(2);
         }
@@ -157,6 +169,10 @@ mod host {
             }
 
             let arg = |i: usize| args.get(i).map(|a| a.to_string_lossy().into_owned());
+            if arg(0).as_deref() == Some("idle") {
+                let secs: u64 = arg(1).and_then(|s| s.parse().ok()).unwrap_or(60);
+                return idle(bon, secs);
+            }
             if arg(0).as_deref() == Some("scan") {
                 let ranges: Option<Vec<_>> = args[1..]
                     .iter()
@@ -168,6 +184,18 @@ mod host {
                 };
                 return scan(bon, &ranges);
             }
+            if arg(0).as_deref() == Some("reopen") {
+                let (Some(space), Some(ch)) = (
+                    arg(1).as_deref().and_then(number),
+                    arg(2).as_deref().and_then(number),
+                ) else {
+                    eprintln!("bad space / channel number");
+                    return ExitCode::from(2);
+                };
+                let secs: u32 = arg(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+                let pause: u64 = arg(4).and_then(|s| s.parse().ok()).unwrap_or(90);
+                return reopen(bon, space, ch, secs, pause);
+            }
             let (Some(space), Some(ch)) = (
                 arg(0).as_deref().and_then(number),
                 arg(1).as_deref().and_then(number),
@@ -176,7 +204,7 @@ mod host {
                 return ExitCode::from(2);
             };
             let secs: u32 = arg(2).and_then(|s| s.parse().ok()).unwrap_or(5);
-            let mut out = match args.get(3) {
+            let out = match args.get(3) {
                 Some(p) => match File::create(p) {
                     Ok(f) => Some(BufWriter::new(f)),
                     Err(e) => {
@@ -192,39 +220,7 @@ mod host {
                 return ExitCode::from(1);
             }
             println!("open: IsTunerOpening={}", bonhost_is_opening(bon));
-            if bonhost_set_channel(bon, space, ch) == 0 {
-                eprintln!("SetChannel({space},{ch}) failed");
-            } else {
-                println!(
-                    "tuned {} / {}  (cur {}/{})",
-                    wide(bonhost_enum_space(bon, space)).unwrap_or_default(),
-                    wide(bonhost_enum_channel(bon, space, ch)).unwrap_or_default(),
-                    bonhost_cur_space(bon),
-                    bonhost_cur_channel(bon)
-                );
-                let t0 = Instant::now();
-                let mut total: u64 = 0;
-                for i in 1..=secs {
-                    while t0.elapsed() < Duration::from_secs(u64::from(i)) {
-                        let (mut p, mut size, mut remain) = (std::ptr::null_mut(), 0u32, 0u32);
-                        if bonhost_wait(bon, 100) == WAIT_OBJECT_0
-                            && bonhost_get_ts(bon, &mut p, &mut size, &mut remain) != 0
-                            && !p.is_null()
-                        {
-                            total += u64::from(size);
-                            if let Some(w) = out.as_mut().filter(|_| size > 0) {
-                                // the driver's buffer stays valid until the next call
-                                let data = std::slice::from_raw_parts(p, size as usize);
-                                if let Err(e) = w.write_all(data) {
-                                    eprintln!("writing the TS: {e}");
-                                    out = None;
-                                }
-                            }
-                        }
-                    }
-                    println!("t={i}s  C/N={:.2} dB  TS={total} B", bonhost_signal(bon));
-                }
-            }
+            let out = stream(bon, space, ch, secs, out);
             bonhost_close(bon);
             if let Some(mut w) = out
                 && let Err(e) = w.flush()
@@ -233,6 +229,97 @@ mod host {
             }
             ExitCode::SUCCESS
         }
+    }
+
+    /// Tune `(space, ch)` on the open tuner and read the TS for `secs`, printing C/N and
+    /// the bytes each second (into `out` too, if given); gives `out` back.
+    unsafe fn stream(
+        bon: Bon,
+        space: u32,
+        ch: u32,
+        secs: u32,
+        mut out: Option<BufWriter<File>>,
+    ) -> Option<BufWriter<File>> {
+        // SAFETY: see `run`.
+        unsafe {
+            if bonhost_set_channel(bon, space, ch) == 0 {
+                eprintln!("SetChannel({space},{ch}) failed");
+                return out;
+            }
+            println!(
+                "tuned {} / {}  (cur {}/{})",
+                wide(bonhost_enum_space(bon, space)).unwrap_or_default(),
+                wide(bonhost_enum_channel(bon, space, ch)).unwrap_or_default(),
+                bonhost_cur_space(bon),
+                bonhost_cur_channel(bon)
+            );
+            let t0 = Instant::now();
+            let mut total: u64 = 0;
+            for i in 1..=secs {
+                while t0.elapsed() < Duration::from_secs(u64::from(i)) {
+                    let (mut p, mut size, mut remain) = (std::ptr::null_mut(), 0u32, 0u32);
+                    if bonhost_wait(bon, 100) == WAIT_OBJECT_0
+                        && bonhost_get_ts(bon, &mut p, &mut size, &mut remain) != 0
+                        && !p.is_null()
+                    {
+                        total += u64::from(size);
+                        if let Some(w) = out.as_mut().filter(|_| size > 0) {
+                            // the driver's buffer stays valid until the next call
+                            let data = std::slice::from_raw_parts(p, size as usize);
+                            if let Err(e) = w.write_all(data) {
+                                eprintln!("writing the TS: {e}");
+                                out = None;
+                            }
+                        }
+                    }
+                }
+                println!("t={i}s  C/N={:.2} dB  TS={total} B", bonhost_signal(bon));
+            }
+            out
+        }
+    }
+
+    /// `reopen`: open, stream, close, wait `pause` s, and all again with the DLL still
+    /// loaded and the driver not released, as a host that keeps it does between viewing
+    /// (TVTest releases it). The driver's log says what it read at the second open.
+    unsafe fn reopen(bon: Bon, space: u32, ch: u32, secs: u32, pause: u64) -> ExitCode {
+        // SAFETY: see `run`.
+        unsafe {
+            for pass in 1..=2 {
+                if pass == 2 {
+                    println!("closed; opening again in {pause} s");
+                    std::thread::sleep(Duration::from_secs(pause));
+                }
+                if bonhost_open(bon) == 0 {
+                    eprintln!("OpenTuner {pass} failed (see DebugView)");
+                    return ExitCode::from(1);
+                }
+                println!("open {pass}: IsTunerOpening={}", bonhost_is_opening(bon));
+                stream(bon, space, ch, secs, None);
+                bonhost_close(bon);
+            }
+        }
+        ExitCode::SUCCESS
+    }
+
+    /// `idle`: open the tuner and hold it `secs` without a channel, then close it: what a
+    /// host does between viewing (the driver's idle keeper runs meanwhile; its log says
+    /// what it noticed, an unplug among them).
+    unsafe fn idle(bon: Bon, secs: u64) -> ExitCode {
+        // SAFETY: see the caller.
+        unsafe {
+            if bonhost_open(bon) == 0 {
+                eprintln!("OpenTuner failed (see DebugView)");
+                return ExitCode::from(1);
+            }
+            println!(
+                "open: IsTunerOpening={}; idle for {secs} s",
+                bonhost_is_opening(bon)
+            );
+            std::thread::sleep(Duration::from_secs(secs));
+            bonhost_close(bon);
+        }
+        ExitCode::SUCCESS
     }
 
     /// A `scan` argument: (space, first channel, last channel or `None` = to the end).

@@ -40,7 +40,7 @@ build() {
 check() {
   cd pix-dt295
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
-  cargo test --frozen -p dt295-usb -p dt295 -p dt295-cli
+  cargo test --frozen -p dt295-usb -p dt295-chdef -p dt295 -p dt295-cli
 }
 
 package() {

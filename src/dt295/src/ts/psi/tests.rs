@@ -500,6 +500,12 @@ fn step8_export_import_and_ageing() {
         e.seen == today && e.sec.len() == sec.len(),
         "export -> import round trip keeps the seen day"
     );
+    // A host that runs on: the section ages out of the cache as at an import.
+    assert!(!t.age(today + PSI_KEEP_DAYS), "exactly 90 days: kept");
+    assert!(!t.changed());
+    assert!(t.age(today + PSI_KEEP_DAYS + 1));
+    assert!(t.changed(), "a change to save");
+    assert!(t.export().is_empty());
 }
 
 // ---------------------------------------------------------------- more cases

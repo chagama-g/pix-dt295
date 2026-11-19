@@ -166,7 +166,9 @@ const DIRECT_END: u32 = 0x0100_0000;
 fn window_set(io: &Io, window: u32, bank: u32) -> Result<()> {
     io.write_block(window, &bank.to_be_bytes())?;
     if rd32(io, window)? != bank {
-        return Err(Error::State(format!("window 0x{window:x} would not hold 0x{bank:08x}")));
+        return Err(Error::State(format!(
+            "window 0x{window:x} would not hold 0x{bank:08x}"
+        )));
     }
     Ok(())
 }
@@ -329,7 +331,9 @@ fn wait_done(io: &Io) -> Result<(bool, u32)> {
         let v = r(io, O_CONTROL)?;
         last = v;
         if v & CT_ERROR != 0 {
-            return Err(Error::State(format!("fj I2C bus error (CONTROL=0x{v:04x})")));
+            return Err(Error::State(format!(
+                "fj I2C bus error (CONTROL=0x{v:04x})"
+            )));
         }
         if v & CT_DONE != 0 {
             return Ok((true, v));
@@ -359,7 +363,11 @@ fn cold_xfer_read(io: &Io, slave: u8, reg: u8, log: &mut Vec<String>) -> Result<
         if st & ST_NACK == 0 { "yes" } else { "NO" }
     ));
     if st & ST_NACK != 0 {
-        let _ = w(io, O_CONTROL, ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART));
+        let _ = w(
+            io,
+            O_CONTROL,
+            ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART),
+        );
         return Err(Error::State(format!("slave 0x{slave:02x} did not ACK")));
     }
     // register byte: advance by clearing only DONE. CONTROL bit4 ("start") is the
@@ -385,9 +393,15 @@ fn cold_xfer_read(io: &Io, slave: u8, reg: u8, log: &mut Vec<String>) -> Result<
     let (d, c) = wait_done(io)?;
     ctl = c;
     let val = (r(io, O_DATA)? & 0xff) as u8;
-    log.push(format!("read byte: DONE={d} CONTROL=0x{ctl:04x} DATA=0x{val:02x}"));
+    log.push(format!(
+        "read byte: DONE={d} CONTROL=0x{ctl:04x} DATA=0x{val:02x}"
+    ));
     // STOP: bits 0,3,4,5 down together.
-    let _ = w(io, O_CONTROL, ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART));
+    let _ = w(
+        io,
+        O_CONTROL,
+        ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART),
+    );
     Ok(val)
 }
 
@@ -697,8 +711,14 @@ fn xfer2(io: &Io, addr7: u8, wb: &[u8], rb: &mut [u8]) -> Result<()> {
     let (done, mut ctl) = wait_done(io)?;
     require_done(done)?;
     if r(io, O_STATUS)? & ST_NACK != 0 {
-        let _ = w(io, O_CONTROL, ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART));
-        return Err(Error::State(format!("fj I2C: slave 0x{addr7:02x} did not ACK")));
+        let _ = w(
+            io,
+            O_CONTROL,
+            ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART),
+        );
+        return Err(Error::State(format!(
+            "fj I2C: slave 0x{addr7:02x} did not ACK"
+        )));
     }
     for &byte in wb {
         w(io, O_DATA, u32::from(byte))?;
@@ -716,22 +736,40 @@ fn xfer2(io: &Io, addr7: u8, wb: &[u8], rb: &mut [u8]) -> Result<()> {
             require_done(done)?;
             ctl = c;
             if r(io, O_STATUS)? & ST_NACK != 0 {
-                let _ = w(io, O_CONTROL, ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART));
-                return Err(Error::State(format!("fj I2C: slave 0x{addr7:02x} read NACK")));
+                let _ = w(
+                    io,
+                    O_CONTROL,
+                    ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART),
+                );
+                return Err(Error::State(format!(
+                    "fj I2C: slave 0x{addr7:02x} read NACK"
+                )));
             }
         }
         let n = rb.len();
         for (i, slot) in rb.iter_mut().enumerate() {
             let base = ctl & !(CT_DONE | CT_RESTART);
             // ACK every byte but the last (NACK the last to end the read).
-            w(io, O_CONTROL, if i + 1 < n { base | CT_ACK } else { base & !CT_ACK })?;
+            w(
+                io,
+                O_CONTROL,
+                if i + 1 < n {
+                    base | CT_ACK
+                } else {
+                    base & !CT_ACK
+                },
+            )?;
             let (done, c) = wait_done(io)?;
             require_done(done)?;
             ctl = c;
             *slot = (r(io, O_DATA)? & 0xff) as u8;
         }
     }
-    let _ = w(io, O_CONTROL, ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART));
+    let _ = w(
+        io,
+        O_CONTROL,
+        ctl & !(CT_DONE | CT_ACK | CT_START | CT_RESTART),
+    );
     Ok(())
 }
 

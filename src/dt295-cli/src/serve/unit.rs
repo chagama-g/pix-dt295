@@ -18,15 +18,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use dt295::state::State;
-use dt295::{
-    CardWatch, Device, RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, System, TsSink, raw_stall_due,
-};
+use dt295::state::{State, key_journal};
+use dt295::{CardWatch, Device, RAW_STALL, System, TsSink, raw_stall_due};
 use tracing::{info, warn};
 
 use super::conf::Conf;
 use super::proto::{Reply, Request, Tuning};
-use crate::tuner::{key_journal, prior_keys, stopping, take_link_keys};
+use crate::rawts;
+use crate::tuner::stopping;
 
 /// A request and the connection its TS goes to.
 pub struct Job {
@@ -121,6 +120,10 @@ struct Unit<'a> {
     state_path: PathBuf,
     /// What the state file holds (the journal also writes keys to it directly).
     state: State,
+    /// The state file is there but could not be read at the open: it is left alone
+    /// (nothing is saved) until the next open reads it, as a write would lose its link
+    /// keys and PSI.
+    state_unreadable: bool,
     /// The journal wrote a key to the state file.
     pending_written: Arc<AtomicBool>,
     /// The last stream delivered nothing: boot again before the next tune.
@@ -141,6 +144,7 @@ impl<'a> Unit<'a> {
             dev: None,
             state_path: conf.state_file(serial),
             state: State::default(),
+            state_unreadable: false,
             pending_written: Arc::new(AtomicBool::new(false)),
             reboot: false,
             watch: None,
@@ -179,14 +183,17 @@ impl<'a> Unit<'a> {
         self.absent_logged = false;
         // the System1 path; before start: the front-end power-on depends on it
         dev.set_trc_firmware(Some(self.conf.trc_firmware()));
-        self.state = match State::load(&self.state_path) {
-            Ok(st) => st.unwrap_or_default(),
+        (self.state, self.state_unreadable) = match State::load_settled(&self.state_path) {
+            Ok(st) => (st.unwrap_or_default(), false),
             Err(e) => {
-                warn!("cannot read {}: {e}", self.state_path.display());
-                State::default()
+                warn!(
+                    "cannot read {} ({e}); leaving it as it is, nothing is saved until it reads",
+                    self.state_path.display()
+                );
+                (State::default(), true)
             }
         };
-        let keys = prior_keys(&self.state);
+        let keys = self.state.prior_keys();
         if !keys.is_empty() {
             dev.set_prior_link_keys(&keys);
         }
@@ -194,8 +201,12 @@ impl<'a> Unit<'a> {
             self.state_path.clone(),
             Arc::clone(&self.pending_written),
         ));
-        for rec in &self.state.psi {
-            dev.psi_import(rec);
+        // what aged out leaves the file now, not only at the next change of the PSI
+        if self.state.import_psi(&mut dev)
+            && !self.state_unreadable
+            && let Err(e) = self.state.save(&self.state_path)
+        {
+            warn!("cannot save {}: {e}", self.state_path.display());
         }
         let t0 = Instant::now();
         match boot(&mut dev, &self.conf.idle_firmware()) {
@@ -281,12 +292,17 @@ impl<'a> Unit<'a> {
                 self.state.pending_keys = file.pending_keys;
             }
         }
-        let mut changed = take_link_keys(&mut self.state, dev);
+        let mut changed = self
+            .state
+            .take_link_keys(dev.link_key(), dev.unproved_link_key());
         if !dev.live().is_streaming() && dev.psi_changed() {
             self.state.psi = dev.psi_export();
             changed = true;
         }
-        if changed && let Err(e) = self.state.save(&self.state_path) {
+        if changed
+            && !self.state_unreadable
+            && let Err(e) = self.state.save(&self.state_path)
+        {
             warn!("cannot save {}: {e}", self.state_path.display());
         }
     }
@@ -490,26 +506,22 @@ impl<'a> Unit<'a> {
 
         let t0 = Instant::now();
         let (pipe, queue) = Pipe::new();
-        if let Err(why) = start_raw(&mut dev, &req, pipe.sink()) {
-            warn!("{}: {why}", req.to_line());
-            let _ = reply(&mut conn, &Reply::Error(why));
-            self.dev = Some(dev);
-            return None;
-        }
+        let full = match rawts::start(&mut dev, req.tuning, pipe.sink()) {
+            Ok(full) => full,
+            Err(why) => {
+                warn!("{}: {why}", req.to_line());
+                let _ = reply(&mut conn, &Reply::Error(why));
+                self.dev = Some(dev);
+                return None;
+            }
+        };
         // the cold bootstrap and the lock wait take seconds; wait (bounded) for the first TS
-        if !wait_raw_ts(&dev, &pipe, RAW_FIRST_TS) {
-            // The worker ends on its own, in about a tune's time: with nothing (Ok) when the
-            // demod does not lock, with the error when the bring-up fails. Only a worker
-            // still running at the deadline waited the whole time. "no lock" is also what a
-            // channel scan skips quietly.
-            let running = dev.raw_running();
-            let why = match (running, dev.stream_stop_raw()) {
-                (false, Ok(_)) => "no lock".to_owned(),
-                (false, Err(e)) => format!("the cold bring-up failed: {e}"),
-                (true, Ok(_)) => format!("no TS within {RAW_FIRST_TS:?}"),
-                (true, Err(e)) => {
-                    format!("no TS within {RAW_FIRST_TS:?}, and the stream worker failed: {e}")
-                }
+        if !rawts::wait_first_ts(&dev, || pipe.bytes.load(Ordering::Relaxed)) {
+            let why = if stopping() {
+                let _ = dev.stream_stop_raw();
+                "the daemon stops".to_owned()
+            } else {
+                rawts::why_no_ts(&mut dev, full)
             };
             warn!("{}: {why}", req.to_line());
             let _ = reply(&mut conn, &Reply::Error(why));
@@ -585,8 +597,11 @@ impl<'a> Unit<'a> {
                 } else {
                     idle_restarts = 0;
                 }
+                if stopping() {
+                    break "the daemon stops";
+                }
                 warn!("raw-TS: the stream worker ended ({bytes} bytes); restarting the channel");
-                if let Err(why) = start_raw(&mut dev, &req, pipe.sink()) {
+                if let Err(why) = rawts::start(&mut dev, req.tuning, pipe.sink()) {
                     warn!("{}: {why}", req.to_line());
                     break "the worker ended and the restart failed";
                 }
@@ -595,15 +610,19 @@ impl<'a> Unit<'a> {
             }
             // a halt never faults the worker: the only stall signal is the byte count not
             // advancing. Restart the channel (stop + retune); a transient stall recovers.
-            if raw_stall_due(&mut stall, pipe.bytes.load(Ordering::Relaxed), Instant::now()) {
+            if raw_stall_due(
+                &mut stall,
+                pipe.bytes.load(Ordering::Relaxed),
+                Instant::now(),
+            ) {
                 warn!("raw-TS: no TS for {RAW_STALL:?} while streaming; restarting the channel");
                 if let Err(e) = dev.stream_stop_raw() {
                     // The stalled worker would not stop (it still holds the device I/O); the
-                    // start_raw below would block on it. End the stream; a re-plug is the reset.
+                    // rawts::start below would refuse it. End the stream; a re-plug is the reset.
                     warn!("raw-TS: could not stop the stalled worker ({e}); ending");
                     break "the stalled worker would not stop";
                 }
-                if let Err(why) = start_raw(&mut dev, &req, pipe.sink()) {
+                if let Err(why) = rawts::start(&mut dev, req.tuning, pipe.sink()) {
                     warn!("{}: {why}", req.to_line());
                     break "the datapath stalled and the restart failed";
                 }
@@ -692,47 +711,6 @@ fn start(dev: &mut Device, req: &Request, sink: TsSink) -> Result<(), String> {
     dev.set_service_id(req.sid);
     dev.stream_start(sink)
         .map_err(|e| format!("stream start: {e}"))
-}
-
-/// Blob-free raw-TS: bring the chip up cold (once per plug) or retune, and stream the
-/// scrambled TS into `sink`. No vendor firmware, no secure session.
-fn start_raw(dev: &mut Device, req: &Request, sink: TsSink) -> Result<(), String> {
-    // A previous worker that would not stop still holds the device I/O; cold_monitor_installed
-    // (and the stream start) below would block on its lock forever. Refuse instead of
-    // deadlocking; a re-plug is the reset. Covers the initial tune and every restart path.
-    if dev.raw_present() {
-        return Err("the previous raw-TS worker has not stopped; re-plug the unit".to_owned());
-    }
-    let (terrestrial, hz, tsid) = match req.tuning {
-        Tuning::Terrestrial { hz } => (true, hz, None),
-        Tuning::Satellite { hz, tsid } => {
-            (false, hz, (tsid != dt295::chan::NO_TSID).then_some(tsid))
-        }
-    };
-    // Decide the bring-up from the chip, not a flag: our monitor BODY persists across a
-    // retune and a reopen, and clears only when a re-plug wipes RAM. The first tune after
-    // a cold open does the whole bring-up; a later one only retunes + rearms. A "TS
-    // flowed" flag would mark an off-air-but-brought-up chip cold and re-run the
-    // once-per-plug bootstrap, which faults. (Same reasoning as the BonDriver.)
-    let full = !dev.cold_monitor_installed();
-    dev.stream_start_cold(terrestrial, hz, tsid, full, RAW_STREAM_CAP, sink)
-        .map_err(|e| format!("raw stream start: {e}"))
-}
-
-/// Wait (bounded) for the raw worker to deliver the first TS, or until it ends (a fault
-/// or an unplug before any TS). `pipe.bytes` is monotonic.
-fn wait_raw_ts(dev: &Device, pipe: &Pipe, within: Duration) -> bool {
-    let t0 = Instant::now();
-    while t0.elapsed() < within {
-        if pipe.bytes.load(Ordering::Relaxed) > 0 {
-            return true;
-        }
-        if !dev.raw_running() {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    pipe.bytes.load(Ordering::Relaxed) > 0
 }
 
 fn reply(conn: &mut UnixStream, r: &Reply) -> std::io::Result<()> {

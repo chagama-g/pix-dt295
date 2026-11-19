@@ -121,6 +121,12 @@ impl Key {
     }
 }
 
+/// Whether a section last delivered on day `seen` is gone from the air by `today`: not
+/// seen for over [`PSI_KEEP_DAYS`].
+fn gone(seen: u32, today: u32) -> bool {
+    u64::from(seen) + u64::from(PSI_KEEP_DAYS) < u64::from(today)
+}
+
 /// One cached section.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -920,8 +926,8 @@ impl PsiKeeper {
         if rec.section.len() > SEC_MAX || !crc::section_crc_ok(&rec.section) {
             return false;
         }
-        if u64::from(rec.seen_day) + u64::from(PSI_KEEP_DAYS) < u64::from(today) {
-            return false; // gone from the air
+        if gone(rec.seen_day, today) {
+            return false;
         }
         // the section's own last_section_number (255 here would let a malformed
         // section through)
@@ -938,6 +944,18 @@ impl PsiKeeper {
         );
         self.cache.dirty = false; // loaded, not changed
         true
+    }
+
+    /// Drop the sections not seen for [`crate::PSI_KEEP_DAYS`] (`today` = Unix day), as
+    /// [`PsiKeeper::import`] does: a host that runs for months would otherwise keep
+    /// re-sending and saving them until its next open. True (and [`PsiKeeper::changed`])
+    /// when any went.
+    pub fn age(&mut self, today: u32) -> bool {
+        let before = self.cache.ent.len();
+        self.cache.ent.retain(|e| !gone(e.seen, today));
+        let aged = self.cache.ent.len() != before;
+        self.cache.dirty |= aged;
+        aged
     }
 
     /// Sections were added or refreshed since the last export / import.

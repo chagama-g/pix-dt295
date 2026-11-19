@@ -549,6 +549,10 @@ fn text_encodings() {
         "settings",
     );
     assert_eq!(s.get("logodirectory").map(String::as_str), Some(".\\Logo"));
+    let t = "[A]\nk=1\nK=2\n# c\n;x=1\nnoeq\n[ b ] tail\nv = \"q\" \n";
+    assert_eq!(ini_section(t, "a").get("k").map(String::as_str), Some("1"));
+    assert_eq!(ini_section(t, "a").len(), 1);
+    assert_eq!(ini_section(t, "B").get("v").map(String::as_str), Some("q"));
 }
 
 #[test]
@@ -688,14 +692,18 @@ fn bondriver_ini() {
         &ini,
         "[Tuner]\r\nDeviceSerial=EF34567890\r\n; StateFile=x\r\nTrcFirmware=\"fw\\trc.bin\"\r\n\
          [BS]\r\nFirmware=no\r\n",
-    );
-    assert_eq!(b.serial.as_deref(), Some("EF34567890"));
-    assert_eq!(b.fw, dir.join("mb86m01_assp_osec_idle.bin"));
-    assert_eq!(b.trc, dir.join("fw\\trc.bin"));
-    assert_eq!(b.state, dir.join("BonDriver_DT295-1.state"));
+    )
+    .unwrap();
+    assert_eq!(b.serial(), Some("EF34567890"));
+    assert_eq!(b.tuner.firmware, dir.join("mb86m01_assp_osec_idle.bin"));
+    assert_eq!(b.tuner.trc_firmware, Some(dir.join("fw\\trc.bin")));
+    assert_eq!(b.tuner.state_file, dir.join("BonDriver_DT295-1.state"));
 
-    let b = BonDriver::from_ini(&ini, "[tuner]\nDeviceSerial=\nStateFile=shared.state\n");
-    assert_eq!((b.serial, b.state), (None, dir.join("shared.state")));
+    let b = BonDriver::from_ini(&ini, "[tuner]\nDeviceSerial=\nStateFile=shared.state\n").unwrap();
+    assert_eq!(
+        (b.serial(), &b.tuner.state_file),
+        (None, &dir.join("shared.state"))
+    );
 }
 
 #[test]
@@ -725,7 +733,7 @@ fn finds_the_bondriver_inis() {
     fs::write(dir.join("BonDriver_Other.ini"), "[Tuner]\r\n").unwrap();
     fs::write(dir.join("BonDriver_DT295.dll"), "").unwrap();
     let found = BonDriver::find(&tv.driver_dir()).unwrap();
-    let serials: Vec<_> = found.iter().map(|b| b.serial.as_deref()).collect();
+    let serials: Vec<_> = found.iter().map(BonDriver::serial).collect();
     assert_eq!(serials, [Some("B"), Some("A")], "by file name");
 }
 
@@ -734,6 +742,7 @@ fn bon(serial: Option<&str>, name: &str) -> BonDriver {
         &Path::new("BD").join(name),
         &serial.map_or_default(|s| format!("[Tuner]\nDeviceSerial={s}\n")),
     )
+    .unwrap()
 }
 
 #[test]
@@ -842,19 +851,6 @@ fn unschedule_needs_no_folder() {
     assert!(parse(&["--unschedule"]).is_ok());
     assert!(parse(&[]).is_err(), "--tvtest otherwise");
     assert!(parse(&["--serial", "EF34567890", "--tvtest", "x"]).is_ok());
-}
-
-#[test]
-fn ini_text_like_the_bondriver() {
-    assert_eq!(decode_ini(b"[Tuner]\r\nA=1"), "[Tuner]\r\nA=1");
-    assert_eq!(decode_ini(b"\xEF\xBB\xBF[T]"), "[T]");
-    assert_eq!(
-        decode_ini(&encode_text("[T]\r\nA=\u{3042}", true)),
-        "[T]\r\nA=\u{3042}"
-    );
-    // not UTF-8: the ANSI code page (CP932 on a Japanese system); never fails
-    let s = decode_ini(b"[Tuner]\r\nStateFile=\x82\xA0.state");
-    assert!(s.starts_with("[Tuner]\r\nStateFile="));
 }
 
 #[test]
