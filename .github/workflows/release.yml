@@ -11,6 +11,7 @@ name: Release
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -26,8 +27,8 @@ env:
 
 jobs:
   meta:
-    # The Gitea origin carries this file too; only the GitHub repository releases.
-    if: github.repository == 'smpn2/pix-dt295'
+    # Permit this GitHub fork to build and package its patched binaries.
+    if: github.repository == 'chagama-g/pix-dt295'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

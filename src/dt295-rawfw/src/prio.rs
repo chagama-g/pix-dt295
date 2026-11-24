@@ -141,3 +141,43 @@ pub(crate) fn raise_stream_threads() -> Result<String, String> {
 pub(crate) fn raise_stream_threads() -> Result<String, String> {
     Err("not supported on this platform".to_owned())
 }
+
+/// Keep Windows' 1 ms wait timeouts accurate for the lifetime of a raw stream.
+/// Without this request a 1 ms WinUSB reap can take a system tick (~15.6 ms),
+/// limiting the 32 KiB pump to ~2 MB/s and eventually overflowing the chip ring.
+/// Each successful request owns one matching release, including on early returns.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct StreamTimerResolution;
+
+#[cfg(windows)]
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+    fn timeEndPeriod(period: u32) -> u32;
+}
+
+#[cfg(windows)]
+impl StreamTimerResolution {
+    pub(crate) fn request() -> Result<Self, u32> {
+        // SAFETY: a documented multimedia timer request; no pointers are passed.
+        let status = unsafe { timeBeginPeriod(1) };
+        if status == 0 {
+            Ok(Self)
+        } else {
+            Err(status)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StreamTimerResolution {
+    fn drop(&mut self) {
+        // SAFETY: this guard exists only after a successful timeBeginPeriod(1).
+        // The period must match, and each guard releases its own request once.
+        let status = unsafe { timeEndPeriod(1) };
+        if status != 0 {
+            tracing::warn!("raw-TS cold: timeEndPeriod(1) failed: {status}");
+        }
+    }
+}

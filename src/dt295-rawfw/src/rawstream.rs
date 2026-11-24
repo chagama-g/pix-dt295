@@ -296,6 +296,19 @@ fn pump_stream(
     sink: &mut TsSink,
     cn_report: Option<&dyn Fn(i32)>,
 ) -> Result<RawCaptureStats> {
+    // Keep the request alive until the stream and its USB queue have stopped.
+    // The guard releases it on every return path (and during panic unwinding).
+    #[cfg(windows)]
+    let _timer_resolution = match crate::prio::StreamTimerResolution::request() {
+        Ok(guard) => {
+            info!("raw-TS cold: requested 1 ms timer resolution");
+            Some(guard)
+        }
+        Err(status) => {
+            warn!("raw-TS cold: timeBeginPeriod(1) failed: {status}; TS may be lost");
+            None
+        }
+    };
     let _ = io.usb.abort_pipe(EP_TS);
     // Past the bring-up, from here on a late pump loses TS (the module doc of `prio`).
     match crate::prio::raise_stream_threads() {
