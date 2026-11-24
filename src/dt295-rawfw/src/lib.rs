@@ -9,6 +9,8 @@
 pub mod fjcore;
 pub mod frmon_host;
 mod prio;
+#[cfg(windows)]
+mod timer_policy;
 pub mod rawstream;
 
 pub use rawstream::{RAW_FIRST_TS, RAW_STALL, RAW_STREAM_CAP, RawCaptureStats, raw_stall_due};

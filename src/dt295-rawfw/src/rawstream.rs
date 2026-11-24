@@ -299,6 +299,17 @@ fn pump_stream(
     // Keep the request alive until the stream and its USB queue have stopped.
     // The guard releases it on every return path (and during panic unwinding).
     #[cfg(windows)]
+    let _timer_policy = match crate::timer_policy::StreamTimerPolicy::request() {
+        Ok(guard) => {
+            info!("raw-TS cold: timer resolution requests honored while minimized");
+            Some(guard)
+        }
+        Err(why) => {
+            warn!("raw-TS cold: could not set timer power policy: {why}; minimized reception may lose TS");
+            None
+        }
+    };
+    #[cfg(windows)]
     let _timer_resolution = match crate::prio::StreamTimerResolution::request() {
         Ok(guard) => {
             info!("raw-TS cold: requested 1 ms timer resolution");
